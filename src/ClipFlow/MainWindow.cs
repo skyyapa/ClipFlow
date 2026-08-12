@@ -1,0 +1,1222 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Data;
+using System.Windows.Input;
+using System.Windows.Interop;
+using System.Windows.Markup;
+using System.Windows.Media;
+using System.Windows.Media.Effects;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
+
+namespace ClipFlow
+{
+    internal sealed class MainWindow : Window
+    {
+        private const int HotkeyId = 17031;
+        private readonly HistoryStore _store;
+        private readonly TextBox _searchBox;
+        private readonly ListBox _resultsList;
+        private readonly TextBlock _statusText;
+        private readonly TextBlock _modeText;
+        private readonly Border _scrollThumb;
+        private readonly DispatcherTimer _captureTimer;
+        private readonly System.Windows.Forms.NotifyIcon _tray;
+        private HwndSource _source;
+        private IntPtr _handle;
+        private IntPtr _returnWindow;
+        private int _captureAttempts;
+        private bool _isPaused;
+        private bool _isExiting;
+        private string _selfWrittenText;
+        private bool _selfWrittenImage;
+        private DateTime _selfWriteExpires;
+        private bool _isWindowDragging;
+        private System.Drawing.Point _dragStartCursor;
+        private double _dragStartLeft;
+        private double _dragStartTop;
+
+        internal MainWindow()
+        {
+            _store = new HistoryStore();
+
+            Title = "ClipFlow";
+            Width = 372;
+            Height = 455;
+            MinWidth = 350;
+            MinHeight = 430;
+            WindowStyle = WindowStyle.None;
+            ResizeMode = ResizeMode.NoResize;
+            AllowsTransparency = false;
+            Background = Brush("#FFF7F7F7");
+            ShowInTaskbar = false;
+            Topmost = true;
+            UseLayoutRounding = true;
+            SnapsToDevicePixels = true;
+            TextOptions.SetTextFormattingMode(this, TextFormattingMode.Display);
+            TextOptions.SetTextRenderingMode(this, TextRenderingMode.ClearType);
+
+            Border shell = new Border
+            {
+                Background = Brush("#FFF7F7F7"),
+                BorderBrush = Brushes.Transparent,
+                BorderThickness = new Thickness(0),
+                CornerRadius = new CornerRadius(0),
+                Padding = new Thickness(12),
+                Effect = null
+            };
+            Content = shell;
+
+            Grid layout = new Grid();
+            layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            layout.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            shell.Child = layout;
+
+            Grid topChrome = new Grid { Margin = new Thickness(4, 0, 2, 8), Background = Brushes.Transparent };
+            topChrome.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            topChrome.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            topChrome.MouseLeftButtonDown += delegate(object sender, MouseButtonEventArgs eventArgs)
+            {
+                if (eventArgs.LeftButton != MouseButtonState.Pressed || IsInsideButton(eventArgs.OriginalSource as DependencyObject)) return;
+                BeginManualWindowDrag(eventArgs);
+            };
+            StackPanel pickerHeader = new StackPanel { Orientation = Orientation.Horizontal };
+            TextBlock pickerTitle = new TextBlock
+            {
+                Text = "ClipFlow",
+                Foreground = Brush("#FF202020"),
+                FontSize = 14,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0)
+            };
+            pickerHeader.Children.Add(pickerTitle);
+            topChrome.Children.Add(pickerHeader);
+            Button closeButton = CreatePlainButton("×");
+            closeButton.FontSize = 21;
+            closeButton.Width = 30;
+            closeButton.Height = 30;
+            closeButton.Click += delegate { Hide(); };
+            Grid.SetColumn(closeButton, 1);
+            topChrome.Children.Add(closeButton);
+            layout.Children.Add(topChrome);
+
+            Grid header = new Grid { Margin = new Thickness(4, 0, 4, 10), Background = Brushes.Transparent };
+            header.MouseLeftButtonDown += delegate(object sender, MouseButtonEventArgs eventArgs)
+            {
+                if (eventArgs.LeftButton != MouseButtonState.Pressed || IsInsideButton(eventArgs.OriginalSource as DependencyObject)) return;
+                BeginManualWindowDrag(eventArgs);
+            };
+            header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            StackPanel brand = new StackPanel { Orientation = Orientation.Horizontal };
+            TextBlock title = new TextBlock
+            {
+                Text = "剪贴板",
+                Foreground = Brush("#FF1A1A1A"),
+                FontSize = 17,
+                FontWeight = FontWeights.SemiBold,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            _modeText = new TextBlock
+            {
+                Text = string.Empty,
+                Foreground = Brush("#FF6B6B6B"),
+                FontSize = 13,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            brand.Children.Add(title);
+            brand.Children.Add(_modeText);
+            header.Children.Add(brand);
+
+            Button clearAll = new Button
+            {
+                Content = "全部清除",
+                Foreground = Brush("#FF252525"),
+                Background = Brushes.White,
+                BorderBrush = Brush("#FFD0D0D0"),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(10, 5, 10, 5),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            clearAll.Click += delegate
+            {
+                MessageBoxResult choice = MessageBox.Show("清空所有未固定的剪贴板历史？", "ClipFlow",
+                    MessageBoxButton.YesNo, MessageBoxImage.Question);
+                if (choice == MessageBoxResult.Yes)
+                {
+                    _store.ClearUnfavorited();
+                    RefreshResults();
+                }
+            };
+            Grid.SetColumn(clearAll, 1);
+            header.Children.Add(clearAll);
+            Grid.SetRow(header, 1);
+            layout.Children.Add(header);
+
+            _searchBox = new TextBox
+            {
+                FontSize = 15,
+                Foreground = Brush("#FF1A1A1A"),
+                Background = Brushes.White,
+                BorderBrush = Brush("#FFD1D1D1"),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(11, 8, 11, 8),
+                CaretBrush = Brush("#FF0067C0"),
+                SelectionBrush = Brush("#FF99C7F0"),
+                VerticalContentAlignment = VerticalAlignment.Center,
+                Style = CreateRoundedSearchBoxStyle()
+            };
+            _searchBox.TextChanged += delegate { RefreshResults(); };
+            Grid.SetRow(_searchBox, 2);
+            layout.Children.Add(_searchBox);
+
+            _resultsList = new ListBox
+            {
+                Background = Brushes.Transparent,
+                BorderThickness = new Thickness(0),
+                Margin = new Thickness(0, 9, 0, 5),
+                Foreground = Brush("#FF1A1A1A"),
+                HorizontalContentAlignment = HorizontalAlignment.Stretch,
+                ItemContainerStyle = CreateItemContainerStyle()
+            };
+            ScrollViewer.SetHorizontalScrollBarVisibility(_resultsList, ScrollBarVisibility.Disabled);
+            ScrollViewer.SetVerticalScrollBarVisibility(_resultsList, ScrollBarVisibility.Hidden);
+            ScrollViewer.SetCanContentScroll(_resultsList, false);
+            _resultsList.PreviewMouseWheel += ResultsPreviewMouseWheel;
+            _resultsList.MouseDoubleClick += delegate { PasteSelected(false); };
+            _resultsList.AddHandler(ScrollViewer.ScrollChangedEvent,
+                new ScrollChangedEventHandler(ResultsScrollChanged));
+
+            Grid resultsHost = new Grid();
+            resultsHost.Children.Add(_resultsList);
+            _scrollThumb = new Border
+            {
+                Width = 3,
+                MinHeight = 18,
+                Background = Brush("#8A6F6F6F"),
+                CornerRadius = new CornerRadius(1.5),
+                HorizontalAlignment = HorizontalAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Top,
+                Margin = new Thickness(0, 9, 1, 0),
+                Visibility = Visibility.Collapsed,
+                IsHitTestVisible = false,
+                RenderTransform = new TranslateTransform()
+            };
+            resultsHost.Children.Add(_scrollThumb);
+            Grid.SetRow(resultsHost, 3);
+            layout.Children.Add(resultsHost);
+
+            Grid footer = new Grid { Margin = new Thickness(2, 4, 2, 0) };
+            footer.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            footer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            _statusText = new TextBlock
+            {
+                Foreground = Brush("#FF686868"),
+                FontSize = 12,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            TextBlock hints = new TextBlock
+            {
+                Text = "Enter 粘贴",
+                Foreground = Brush("#FF777777"),
+                FontSize = 12,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            footer.Children.Add(_statusText);
+            Grid.SetColumn(hints, 1);
+            footer.Children.Add(hints);
+            Grid.SetRow(footer, 4);
+            layout.Children.Add(footer);
+
+            _captureTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(70) };
+            _captureTimer.Tick += CaptureTimerTick;
+
+            _tray = CreateTrayIcon();
+
+            PreviewKeyDown += WindowPreviewKeyDown;
+            MouseMove += WindowDragMouseMove;
+            MouseLeftButtonUp += WindowDragMouseUp;
+            Deactivated += delegate { if (!_isExiting) Hide(); };
+            Closing += WindowClosing;
+            SourceInitialized += delegate { EnableAcrylicBackground(); };
+        }
+
+        internal void StartBackground()
+        {
+            WindowInteropHelper helper = new WindowInteropHelper(this);
+            _handle = helper.EnsureHandle();
+            _source = HwndSource.FromHwnd(_handle);
+            _source.AddHook(WindowMessageHook);
+
+            NativeMethods.AddClipboardFormatListener(_handle);
+            bool hotkeyReady = NativeMethods.RegisterHotKey(_handle, HotkeyId,
+                NativeMethods.MOD_CONTROL | NativeMethods.MOD_SHIFT, NativeMethods.VK_V);
+
+            _tray.Visible = true;
+            if (!hotkeyReady)
+            {
+                _tray.ShowBalloonTip(4000, "ClipFlow",
+                    "Ctrl+Shift+V 已被其他程序占用。可从托盘打开 ClipFlow。",
+                    System.Windows.Forms.ToolTipIcon.Warning);
+            }
+            RefreshResults();
+        }
+
+        internal void ShowPalette()
+        {
+            IntPtr foreground = NativeMethods.GetForegroundWindow();
+            if (foreground != _handle) _returnWindow = foreground;
+
+            _searchBox.Text = string.Empty;
+            RefreshResults();
+            Show();
+            PositionNearCursor();
+            Activate();
+            _searchBox.Focus();
+            Keyboard.Focus(_searchBox);
+        }
+
+        internal void ExitApplication()
+        {
+            _isExiting = true;
+            if (_handle != IntPtr.Zero)
+            {
+                NativeMethods.RemoveClipboardFormatListener(_handle);
+                NativeMethods.UnregisterHotKey(_handle, HotkeyId);
+            }
+            if (_source != null) _source.RemoveHook(WindowMessageHook);
+            _tray.Visible = false;
+            _tray.Dispose();
+            Application.Current.Shutdown();
+        }
+
+        private IntPtr WindowMessageHook(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (message == NativeMethods.WM_HOTKEY && wParam.ToInt32() == HotkeyId)
+            {
+                ShowPalette();
+                handled = true;
+            }
+            else if (message == NativeMethods.WM_CLIPBOARDUPDATE && !_isPaused)
+            {
+                _captureAttempts = 0;
+                _captureTimer.Stop();
+                _captureTimer.Start();
+            }
+            return IntPtr.Zero;
+        }
+
+        private void CaptureTimerTick(object sender, EventArgs eventArgs)
+        {
+            _captureTimer.Stop();
+            try
+            {
+                BitmapSource image = TryGetClipboardImage();
+                if (image != null)
+                {
+                    if (_selfWrittenImage && DateTime.Now <= _selfWriteExpires)
+                    {
+                        _selfWrittenImage = false;
+                        return;
+                    }
+
+                    string imageSourceApp;
+                    string imageSourceTitle;
+                    GetForegroundApp(out imageSourceApp, out imageSourceTitle);
+                    _store.AddOrRefreshImage(image, imageSourceApp, imageSourceTitle);
+                    if (IsVisible) RefreshResults();
+                    return;
+                }
+
+                if (!Clipboard.ContainsText(TextDataFormat.UnicodeText)) return;
+                string text = Clipboard.GetText(TextDataFormat.UnicodeText);
+                if (string.IsNullOrEmpty(text)) return;
+
+                if (!string.IsNullOrEmpty(_selfWrittenText) && DateTime.Now <= _selfWriteExpires &&
+                    string.Equals(text, _selfWrittenText, StringComparison.Ordinal))
+                {
+                    _selfWrittenText = null;
+                    return;
+                }
+
+                string rtf = Clipboard.ContainsData(DataFormats.Rtf) ? Clipboard.GetData(DataFormats.Rtf) as string : null;
+                string html = Clipboard.ContainsData(DataFormats.Html) ? Clipboard.GetData(DataFormats.Html) as string : null;
+                string sourceApp;
+                string sourceTitle;
+                GetForegroundApp(out sourceApp, out sourceTitle);
+                _store.AddOrRefresh(text, rtf, html, sourceApp, sourceTitle);
+                if (IsVisible) RefreshResults();
+            }
+            catch (ExternalException)
+            {
+                RetryCapture();
+            }
+        }
+
+        private void RetryCapture()
+        {
+            _captureAttempts++;
+            if (_captureAttempts >= 5) return;
+            _captureTimer.Interval = TimeSpan.FromMilliseconds(70 * _captureAttempts);
+            _captureTimer.Start();
+        }
+
+        private void RefreshResults()
+        {
+            ClipboardItem selected = GetSelectedItem();
+            List<ClipboardItem> results = _store.Search(_searchBox.Text, 100);
+            _resultsList.Items.Clear();
+            foreach (ClipboardItem item in results)
+            {
+                _resultsList.Items.Add(CreateResultListItem(item));
+            }
+            if (results.Count > 0)
+            {
+                int index = selected == null ? 0 : results.FindIndex(item => item.Id == selected.Id);
+                _resultsList.SelectedIndex = index >= 0 ? index : 0;
+            }
+            _statusText.Text = results.Count.ToString() + " 条结果" + (_isPaused ? "  ·  已暂停记录" : string.Empty);
+            _modeText.Text = _isPaused ? "  已暂停" : string.Empty;
+        }
+
+        private void PasteSelected(bool plainTextOnly)
+        {
+            ClipboardItem item = GetSelectedItem();
+            if (item == null) return;
+
+            try
+            {
+                if (item.IsImage)
+                {
+                    BitmapSource bitmap = LoadBitmap(item.ImagePath);
+                    if (bitmap == null)
+                    {
+                        _statusText.Text = "图片文件已丢失";
+                        return;
+                    }
+                    _selfWrittenImage = true;
+                    _selfWriteExpires = DateTime.Now.AddSeconds(2);
+                    Clipboard.SetImage(bitmap);
+                    _store.MarkUsed(item);
+                }
+                else
+                {
+                    if (string.IsNullOrEmpty(item.Text)) return;
+                DataObject data = new DataObject();
+                data.SetData(DataFormats.UnicodeText, item.Text);
+                data.SetData(DataFormats.Text, item.Text);
+                if (!plainTextOnly)
+                {
+                    if (!string.IsNullOrEmpty(item.Rtf)) data.SetData(DataFormats.Rtf, item.Rtf);
+                    if (!string.IsNullOrEmpty(item.Html)) data.SetData(DataFormats.Html, item.Html);
+                }
+                _selfWrittenText = item.Text;
+                _selfWriteExpires = DateTime.Now.AddSeconds(2);
+                Clipboard.SetDataObject(data, true);
+                _store.MarkUsed(item);
+                }
+            }
+            catch (ExternalException)
+            {
+                _statusText.Text = "剪贴板正被其他应用占用，请重试";
+                return;
+            }
+
+            Hide();
+            DispatcherTimer pasteTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(90) };
+            pasteTimer.Tick += delegate
+            {
+                pasteTimer.Stop();
+                if (_returnWindow != IntPtr.Zero) NativeMethods.SetForegroundWindow(_returnWindow);
+                NativeMethods.SendPaste();
+            };
+            pasteTimer.Start();
+        }
+
+        private static BitmapSource TryGetClipboardImage()
+        {
+            try
+            {
+                if (Clipboard.ContainsImage())
+                {
+                    BitmapSource direct = Clipboard.GetImage();
+                    if (direct != null)
+                    {
+                        if (direct.CanFreeze) direct.Freeze();
+                        return direct;
+                    }
+                }
+
+                IDataObject data = Clipboard.GetDataObject();
+                if (data == null) return null;
+                string[] pngFormats = { "PNG", "image/png" };
+                foreach (string format in pngFormats)
+                {
+                    if (!data.GetDataPresent(format, true)) continue;
+                    object raw = data.GetData(format, true);
+                    Stream stream = raw as Stream;
+                    if (stream != null)
+                    {
+                        if (stream.CanSeek) stream.Position = 0;
+                        BitmapFrame frame = BitmapFrame.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+                        frame.Freeze();
+                        return frame;
+                    }
+                    byte[] bytes = raw as byte[];
+                    if (bytes != null && bytes.Length > 0)
+                    {
+                        using (MemoryStream memory = new MemoryStream(bytes))
+                        {
+                            BitmapFrame frame = BitmapFrame.Create(memory, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+                            frame.Freeze();
+                            return frame;
+                        }
+                    }
+                    System.Drawing.Image drawingImage = raw as System.Drawing.Image;
+                    if (drawingImage != null)
+                    {
+                        using (MemoryStream memory = new MemoryStream())
+                        {
+                            drawingImage.Save(memory, System.Drawing.Imaging.ImageFormat.Png);
+                            memory.Position = 0;
+                            BitmapFrame frame = BitmapFrame.Create(memory, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+                            frame.Freeze();
+                            return frame;
+                        }
+                    }
+                }
+
+                if (data.GetDataPresent(DataFormats.Bitmap, true))
+                {
+                    object rawBitmap = data.GetData(DataFormats.Bitmap, true);
+                    BitmapSource source = rawBitmap as BitmapSource;
+                    if (source != null)
+                    {
+                        if (source.CanFreeze) source.Freeze();
+                        return source;
+                    }
+
+                    System.Drawing.Bitmap drawingBitmap = rawBitmap as System.Drawing.Bitmap;
+                    if (drawingBitmap != null)
+                    {
+                        IntPtr handle = drawingBitmap.GetHbitmap();
+                        try
+                        {
+                            BitmapSource converted = Imaging.CreateBitmapSourceFromHBitmap(handle, IntPtr.Zero,
+                                Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
+                            converted.Freeze();
+                            return converted;
+                        }
+                        finally { NativeMethods.DeleteObject(handle); }
+                    }
+                }
+            }
+            catch (ExternalException) { throw; }
+            catch { }
+            return null;
+        }
+
+        private static BitmapSource LoadBitmap(string path)
+        {
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return null;
+            try
+            {
+                byte[] bytes = File.ReadAllBytes(path);
+                using (MemoryStream stream = new MemoryStream(bytes))
+                {
+                    BitmapDecoder decoder = BitmapDecoder.Create(stream,
+                        BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+                    FormatConvertedBitmap bitmap = new FormatConvertedBitmap(
+                        decoder.Frames[0], PixelFormats.Bgr32, null, 0);
+                    bitmap.Freeze();
+                    return bitmap;
+                }
+            }
+            catch { return null; }
+        }
+
+        private void WindowPreviewKeyDown(object sender, KeyEventArgs eventArgs)
+        {
+            if (eventArgs.Key == Key.Escape)
+            {
+                Hide();
+                eventArgs.Handled = true;
+                return;
+            }
+
+            if (eventArgs.Key == Key.Down || eventArgs.Key == Key.Up)
+            {
+                int count = _resultsList.Items.Count;
+                if (count == 0) return;
+                int delta = eventArgs.Key == Key.Down ? 1 : -1;
+                int next = Math.Max(0, Math.Min(count - 1, _resultsList.SelectedIndex + delta));
+                _resultsList.SelectedIndex = next;
+                _resultsList.ScrollIntoView(_resultsList.SelectedItem);
+                eventArgs.Handled = true;
+                return;
+            }
+
+            if (eventArgs.Key == Key.Enter)
+            {
+                PasteSelected((Keyboard.Modifiers & ModifierKeys.Shift) == ModifierKeys.Shift);
+                eventArgs.Handled = true;
+                return;
+            }
+
+            if (eventArgs.Key == Key.S && (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control)
+            {
+                ClipboardItem item = GetSelectedItem();
+                _store.ToggleFavorite(item);
+                RefreshResults();
+                eventArgs.Handled = true;
+                return;
+            }
+
+            if (eventArgs.Key == Key.Delete)
+            {
+                ClipboardItem item = GetSelectedItem();
+                _store.Remove(item);
+                RefreshResults();
+                eventArgs.Handled = true;
+            }
+        }
+
+        private void PositionNearCursor()
+        {
+            System.Drawing.Point cursor = System.Windows.Forms.Cursor.Position;
+            System.Windows.Forms.Screen screen = System.Windows.Forms.Screen.FromPoint(cursor);
+            System.Drawing.Rectangle area = screen.WorkingArea;
+            IntPtr window = _handle != IntPtr.Zero ? _handle : new WindowInteropHelper(this).Handle;
+            if (window == IntPtr.Zero) return;
+
+            NativeMethods.RECT rect;
+            if (!NativeMethods.GetWindowRect(window, out rect)) return;
+            int windowWidth = rect.Right - rect.Left;
+            int windowHeight = rect.Bottom - rect.Top;
+            const int edgeGap = 12;
+            int targetX = area.Right - windowWidth - edgeGap;
+            int targetY = area.Bottom - windowHeight - edgeGap;
+            NativeMethods.SetWindowPos(window, IntPtr.Zero, targetX, targetY, 0, 0,
+                NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOZORDER | NativeMethods.SWP_NOACTIVATE);
+        }
+
+        private void EnableAcrylicBackground()
+        {
+            IntPtr window = new WindowInteropHelper(this).Handle;
+            if (window == IntPtr.Zero) return;
+
+            int cornerPreference = NativeMethods.DWMWCP_ROUND;
+            NativeMethods.DwmSetWindowAttribute(window, NativeMethods.DWMWA_WINDOW_CORNER_PREFERENCE,
+                ref cornerPreference, sizeof(int));
+
+            int darkMode = 0;
+            NativeMethods.DwmSetWindowAttribute(window, NativeMethods.DWMWA_USE_IMMERSIVE_DARK_MODE,
+                ref darkMode, sizeof(int));
+
+            int backdrop = NativeMethods.DWMSBT_NONE;
+            NativeMethods.DwmSetWindowAttribute(window,
+                NativeMethods.DWMWA_SYSTEMBACKDROP_TYPE, ref backdrop, sizeof(int));
+        }
+
+        private void ResultsScrollChanged(object sender, ScrollChangedEventArgs eventArgs)
+        {
+            if (eventArgs.ExtentHeight <= eventArgs.ViewportHeight || eventArgs.ViewportHeight <= 0)
+            {
+                _scrollThumb.Visibility = Visibility.Collapsed;
+                return;
+            }
+
+            double availableHeight = Math.Max(0, _resultsList.ActualHeight - 14);
+            double thumbHeight = Math.Max(18,
+                availableHeight * eventArgs.ViewportHeight / eventArgs.ExtentHeight);
+            double travel = Math.Max(0, availableHeight - thumbHeight);
+            double range = Math.Max(1, eventArgs.ExtentHeight - eventArgs.ViewportHeight);
+            double offset = travel * eventArgs.VerticalOffset / range;
+            _scrollThumb.Height = thumbHeight;
+            TranslateTransform transform = _scrollThumb.RenderTransform as TranslateTransform;
+            if (transform != null) transform.Y = offset;
+            _scrollThumb.Visibility = Visibility.Visible;
+        }
+
+        private void ResultsPreviewMouseWheel(object sender, MouseWheelEventArgs eventArgs)
+        {
+            ScrollViewer viewer = FindVisualChild<ScrollViewer>(_resultsList);
+            if (viewer == null) return;
+
+            // Mouse wheel reports 120 units per notch. Divide by six for a compact
+            // 20px movement while retaining proportional precision for touchpads.
+            double pixelDelta = eventArgs.Delta / 6.0;
+            viewer.ScrollToVerticalOffset(viewer.VerticalOffset - pixelDelta);
+            eventArgs.Handled = true;
+        }
+
+        private static T FindVisualChild<T>(DependencyObject parent) where T : DependencyObject
+        {
+            if (parent == null) return null;
+            int count = VisualTreeHelper.GetChildrenCount(parent);
+            for (int index = 0; index < count; index++)
+            {
+                DependencyObject child = VisualTreeHelper.GetChild(parent, index);
+                T match = child as T;
+                if (match != null) return match;
+                match = FindVisualChild<T>(child);
+                if (match != null) return match;
+            }
+            return null;
+        }
+
+        private static void GetForegroundApp(out string app, out string title)
+        {
+            app = "未知应用";
+            title = string.Empty;
+            try
+            {
+                IntPtr window = NativeMethods.GetForegroundWindow();
+                uint processId;
+                NativeMethods.GetWindowThreadProcessId(window, out processId);
+                Process process = Process.GetProcessById((int)processId);
+                app = process.ProcessName;
+                StringBuilder buffer = new StringBuilder(512);
+                NativeMethods.GetWindowText(window, buffer, buffer.Capacity);
+                title = buffer.ToString();
+            }
+            catch { }
+        }
+
+        private System.Windows.Forms.NotifyIcon CreateTrayIcon()
+        {
+            System.Windows.Forms.NotifyIcon tray = new System.Windows.Forms.NotifyIcon
+            {
+                Text = "ClipFlow 剪贴板管理器",
+                Icon = System.Drawing.SystemIcons.Application
+            };
+            System.Windows.Forms.ContextMenuStrip menu = new System.Windows.Forms.ContextMenuStrip();
+            System.Windows.Forms.ToolStripMenuItem open = new System.Windows.Forms.ToolStripMenuItem("打开 ClipFlow");
+            System.Windows.Forms.ToolStripMenuItem pause = new System.Windows.Forms.ToolStripMenuItem("暂停记录");
+            System.Windows.Forms.ToolStripMenuItem clear = new System.Windows.Forms.ToolStripMenuItem("清空未收藏历史");
+            System.Windows.Forms.ToolStripMenuItem exit = new System.Windows.Forms.ToolStripMenuItem("退出");
+            open.Click += delegate { Dispatcher.BeginInvoke(new Action(ShowPalette)); };
+            pause.Click += delegate
+            {
+                _isPaused = !_isPaused;
+                pause.Text = _isPaused ? "恢复记录" : "暂停记录";
+                Dispatcher.BeginInvoke(new Action(RefreshResults));
+            };
+            clear.Click += delegate
+            {
+                Dispatcher.BeginInvoke(new Action(delegate
+                {
+                    MessageBoxResult choice = MessageBox.Show("清空所有未收藏的剪贴板历史？", "ClipFlow",
+                        MessageBoxButton.YesNo, MessageBoxImage.Question);
+                    if (choice == MessageBoxResult.Yes)
+                    {
+                        _store.ClearUnfavorited();
+                        RefreshResults();
+                    }
+                }));
+            };
+            exit.Click += delegate { Dispatcher.BeginInvoke(new Action(ExitApplication)); };
+            menu.Items.Add(open);
+            menu.Items.Add(pause);
+            menu.Items.Add(clear);
+            menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+            menu.Items.Add(exit);
+            tray.ContextMenuStrip = menu;
+            tray.DoubleClick += delegate { Dispatcher.BeginInvoke(new Action(ShowPalette)); };
+            return tray;
+        }
+
+        private void WindowClosing(object sender, System.ComponentModel.CancelEventArgs eventArgs)
+        {
+            if (_isExiting) return;
+            eventArgs.Cancel = true;
+            Hide();
+        }
+
+        private static Brush Brush(string value)
+        {
+            return new SolidColorBrush((Color)ColorConverter.ConvertFromString(value));
+        }
+
+        private ClipboardItem GetSelectedItem()
+        {
+            ListBoxItem container = _resultsList.SelectedItem as ListBoxItem;
+            return container == null ? null : container.Tag as ClipboardItem;
+        }
+
+        private ListBoxItem CreateResultListItem(ClipboardItem item)
+        {
+            if (item.IsImage)
+            {
+                Grid imageCard = new Grid { Height = 68 };
+                imageCard.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                imageCard.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+                double aspect = item.ImageHeight > 0 ? (double)item.ImageWidth / item.ImageHeight : 1.0;
+                double thumbnailWidth = Math.Max(44, Math.Min(280, 62 * aspect));
+
+                Border imageFrame = new Border
+                {
+                    Width = thumbnailWidth,
+                    Height = 62,
+                    Background = Brushes.Transparent,
+                    CornerRadius = new CornerRadius(5),
+                    ClipToBounds = true,
+                    Margin = new Thickness(0, 3, 12, 3),
+                    HorizontalAlignment = HorizontalAlignment.Left
+                };
+                BitmapSource source = item.Thumbnail;
+                if (source != null)
+                {
+                    imageFrame.Child = new Image
+                    {
+                        Source = source,
+                        Stretch = Stretch.Uniform,
+                        HorizontalAlignment = HorizontalAlignment.Stretch,
+                        VerticalAlignment = VerticalAlignment.Stretch
+                    };
+                }
+                else
+                {
+                    imageFrame.Child = new TextBlock
+                    {
+                        Text = "图片无法读取",
+                        Foreground = Brush("#FF777777"),
+                        HorizontalAlignment = HorizontalAlignment.Center,
+                        VerticalAlignment = VerticalAlignment.Center
+                    };
+                }
+                imageCard.Children.Add(imageFrame);
+
+                Grid actions = new Grid();
+                actions.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                actions.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+                actions.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                Grid.SetColumn(actions, 1);
+
+                Button moreButton = CreateCardIconButton("\uE712", "更多");
+                moreButton.HorizontalAlignment = HorizontalAlignment.Right;
+                moreButton.VerticalAlignment = VerticalAlignment.Top;
+                moreButton.Click += delegate
+                {
+                    ContextMenu menu = new ContextMenu();
+                    MenuItem favorite = new MenuItem { Header = item.IsFavorite ? "取消固定" : "固定" };
+                    MenuItem delete = new MenuItem { Header = "删除" };
+                    favorite.Click += delegate { _store.ToggleFavorite(item); RefreshResults(); };
+                    delete.Click += delegate { _store.Remove(item); RefreshResults(); };
+                    menu.Items.Add(favorite);
+                    menu.Items.Add(delete);
+                    moreButton.ContextMenu = menu;
+                    menu.IsOpen = true;
+                };
+                actions.Children.Add(moreButton);
+
+                Button pinButton = CreateCardIconButton(item.IsFavorite ? "\uE77A" : "\uE718", item.IsFavorite ? "取消固定" : "固定");
+                pinButton.HorizontalAlignment = HorizontalAlignment.Right;
+                pinButton.VerticalAlignment = VerticalAlignment.Bottom;
+                pinButton.Click += delegate { _store.ToggleFavorite(item); RefreshResults(); };
+                Grid.SetRow(pinButton, 2);
+                actions.Children.Add(pinButton);
+                imageCard.Children.Add(actions);
+
+                return new ListBoxItem
+                {
+                    Tag = item,
+                    Content = imageCard,
+                    HorizontalContentAlignment = HorizontalAlignment.Stretch
+                };
+            }
+
+            StackPanel stack = new StackPanel();
+            stack.Children.Add(new TextBlock
+            {
+                Text = item.DisplayPreview,
+                FontSize = 15,
+                Foreground = Brush("#FF1A1A1A"),
+                TextTrimming = TextTrimming.CharacterEllipsis
+            });
+            stack.Children.Add(new TextBlock
+            {
+                Text = item.Detail,
+                FontSize = 12,
+                Foreground = Brush("#FF6E6E6E"),
+                Margin = new Thickness(0, 5, 0, 0)
+            });
+
+            return new ListBoxItem
+            {
+                Tag = item,
+                Content = stack,
+                HorizontalContentAlignment = HorizontalAlignment.Stretch
+            };
+        }
+
+        private static Button CreateCardIconButton(string glyph, string accessibleName)
+        {
+            Button button = new Button
+            {
+                Foreground = Brush("#FF202020"),
+                Background = Brushes.Transparent,
+                BorderThickness = new Thickness(0),
+                Padding = new Thickness(6),
+                Width = 28,
+                Height = 28,
+                Cursor = Cursors.Hand,
+                ToolTip = accessibleName
+            };
+            if (accessibleName == "更多")
+            {
+                button.Content = new TextBlock
+                {
+                    Text = "•••",
+                    FontFamily = new FontFamily("Segoe UI"),
+                    FontSize = 14,
+                    FontWeight = FontWeights.Bold,
+                    Foreground = Brush("#FF202020"),
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+            }
+            else
+            {
+                Canvas pinCanvas = new Canvas { Width = 20, Height = 20 };
+                System.Windows.Shapes.Path pin = new System.Windows.Shapes.Path
+                {
+                    Data = Geometry.Parse("M 6,3 L 14,3 L 13,8 L 16,11 L 4,11 L 7,8 Z M 10,11 L 10,18"),
+                    Stroke = Brush("#FF202020"),
+                    StrokeThickness = 1.5,
+                    StrokeStartLineCap = PenLineCap.Round,
+                    StrokeEndLineCap = PenLineCap.Round,
+                    StrokeLineJoin = PenLineJoin.Round,
+                    Fill = accessibleName == "取消固定" ? Brush("#FF202020") : Brushes.Transparent,
+                    Stretch = Stretch.Uniform,
+                    Width = 16,
+                    Height = 16,
+                    RenderTransform = new RotateTransform(40, 8, 8)
+                };
+                Canvas.SetLeft(pin, 2);
+                Canvas.SetTop(pin, 2);
+                pinCanvas.Children.Add(pin);
+                button.Content = pinCanvas;
+            }
+            return button;
+        }
+
+        private static Button CreatePlainButton(string text)
+        {
+            return new Button
+            {
+                Content = text,
+                FontFamily = new FontFamily("Segoe UI"),
+                Foreground = Brush("#FF202020"),
+                Background = Brushes.Transparent,
+                BorderThickness = new Thickness(0),
+                Padding = new Thickness(4),
+                Cursor = Cursors.Hand
+            };
+        }
+
+        private static Border CreateTopTab(string kind, bool selected)
+        {
+            Button button = CreatePlainButton(string.Empty);
+            button.Content = CreateTopTabIcon(kind);
+            button.Width = 40;
+            button.Height = 38;
+            Border tab = new Border
+            {
+                BorderBrush = selected ? Brush("#FF0078D4") : Brushes.Transparent,
+                BorderThickness = new Thickness(0, 0, 0, selected ? 3 : 0),
+                Margin = new Thickness(0, 0, 2, 0),
+                Child = button
+            };
+            return tab;
+        }
+
+        private static UIElement CreateTopTabIcon(string kind)
+        {
+            if (kind == "gif")
+            {
+                return new Border
+                {
+                    BorderBrush = Brush("#FF202020"),
+                    BorderThickness = new Thickness(1.2),
+                    CornerRadius = new CornerRadius(2),
+                    Padding = new Thickness(2, 0, 2, 0),
+                    Child = new TextBlock { Text = "GIF", FontSize = 9, FontWeight = FontWeights.SemiBold }
+                };
+            }
+            if (kind == "kaomoji")
+                return new TextBlock { Text = ";-)", FontSize = 17, Foreground = Brush("#FF202020") };
+            if (kind == "symbols")
+                return new TextBlock { Text = "%↻\n△+", FontSize = 9, LineHeight = 9, TextAlignment = TextAlignment.Center, Foreground = Brush("#FF202020") };
+
+            Canvas canvas = new Canvas { Width = 22, Height = 22 };
+            if (kind == "smile")
+            {
+                canvas.Children.Add(new System.Windows.Shapes.Ellipse
+                {
+                    Width = 18, Height = 18, Stroke = Brush("#FF202020"), StrokeThickness = 1.4
+                });
+                canvas.Children.Add(CreateDot(5, 6));
+                canvas.Children.Add(CreateDot(11, 6));
+                System.Windows.Shapes.Path smile = new System.Windows.Shapes.Path
+                {
+                    Data = Geometry.Parse("M 5,11 C 7,15 11,15 13,11"),
+                    Stroke = Brush("#FF202020"), StrokeThickness = 1.2, Fill = Brushes.Transparent
+                };
+                canvas.Children.Add(smile);
+                return canvas;
+            }
+
+            System.Windows.Shapes.Path clipboard = new System.Windows.Shapes.Path
+            {
+                Data = Geometry.Parse("M 6,5 L 16,5 L 16,19 L 6,19 Z M 9,3 L 13,3 L 14,6 L 8,6 Z"),
+                Stroke = Brush("#FF202020"), StrokeThickness = 1.3, Fill = Brushes.Transparent,
+                StrokeLineJoin = PenLineJoin.Round
+            };
+            canvas.Children.Add(clipboard);
+            if (kind == "heart")
+            {
+                System.Windows.Shapes.Path heart = new System.Windows.Shapes.Path
+                {
+                    Data = Geometry.Parse("M 11,15 C 9,13 7,12 7,9 C 7,6 11,6 11,9 C 11,6 15,6 15,9 C 15,12 13,13 11,15 Z"),
+                    Fill = Brush("#FF202020"), Stroke = Brush("#FF202020"), StrokeThickness = 0.6
+                };
+                canvas.Children.Add(heart);
+            }
+            else
+            {
+                for (int index = 0; index < 3; index++)
+                {
+                    System.Windows.Shapes.Line line = new System.Windows.Shapes.Line
+                    {
+                        X1 = 9, X2 = 14, Y1 = 10 + index * 3, Y2 = 10 + index * 3,
+                        Stroke = Brush("#FF202020"), StrokeThickness = 1
+                    };
+                    canvas.Children.Add(line);
+                }
+            }
+            return canvas;
+        }
+
+        private static System.Windows.Shapes.Ellipse CreateDot(double left, double top)
+        {
+            System.Windows.Shapes.Ellipse dot = new System.Windows.Shapes.Ellipse
+            {
+                Width = 2, Height = 2, Fill = Brush("#FF202020")
+            };
+            Canvas.SetLeft(dot, left);
+            Canvas.SetTop(dot, top);
+            return dot;
+        }
+
+        private static Style CreateThinScrollBarStyle()
+        {
+            const string xaml = @"
+<Style xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'
+       xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
+       TargetType='{x:Type ScrollBar}'>
+  <Setter Property='Width' Value='4'/>
+  <Setter Property='Background' Value='Transparent'/>
+  <Setter Property='Template'>
+    <Setter.Value>
+      <ControlTemplate TargetType='{x:Type ScrollBar}'>
+        <Grid Background='Transparent'>
+          <Track x:Name='PART_Track' Orientation='Vertical' IsDirectionReversed='True'
+                 Minimum='{TemplateBinding Minimum}' Maximum='{TemplateBinding Maximum}'
+                 Value='{TemplateBinding Value}' ViewportSize='{TemplateBinding ViewportSize}'>
+            <Track.DecreaseRepeatButton>
+              <RepeatButton Command='{x:Static ScrollBar.PageUpCommand}' Opacity='0' Focusable='False'/>
+            </Track.DecreaseRepeatButton>
+            <Track.Thumb>
+              <Thumb>
+                <Thumb.Template>
+                  <ControlTemplate TargetType='{x:Type Thumb}'>
+                    <Border Background='#8A8A8A' CornerRadius='2'/>
+                  </ControlTemplate>
+                </Thumb.Template>
+              </Thumb>
+            </Track.Thumb>
+            <Track.IncreaseRepeatButton>
+              <RepeatButton Command='{x:Static ScrollBar.PageDownCommand}' Opacity='0' Focusable='False'/>
+            </Track.IncreaseRepeatButton>
+          </Track>
+        </Grid>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>";
+            return (Style)XamlReader.Parse(xaml);
+        }
+
+        private static bool IsInsideButton(DependencyObject source)
+        {
+            DependencyObject current = source;
+            while (current != null)
+            {
+                if (current is Button) return true;
+                try { current = VisualTreeHelper.GetParent(current); }
+                catch (InvalidOperationException) { current = LogicalTreeHelper.GetParent(current); }
+            }
+            return false;
+        }
+
+        private void BeginManualWindowDrag(MouseButtonEventArgs eventArgs)
+        {
+            _isWindowDragging = true;
+            _dragStartCursor = System.Windows.Forms.Cursor.Position;
+            _dragStartLeft = Left;
+            _dragStartTop = Top;
+            Mouse.Capture(this);
+            eventArgs.Handled = true;
+        }
+
+        private void WindowDragMouseMove(object sender, MouseEventArgs eventArgs)
+        {
+            if (!_isWindowDragging) return;
+            if (eventArgs.LeftButton != MouseButtonState.Pressed)
+            {
+                EndManualWindowDrag();
+                return;
+            }
+
+            System.Drawing.Point current = System.Windows.Forms.Cursor.Position;
+            Vector physicalDelta = new Vector(current.X - _dragStartCursor.X, current.Y - _dragStartCursor.Y);
+            PresentationSource source = PresentationSource.FromVisual(this);
+            Vector logicalDelta = source != null && source.CompositionTarget != null
+                ? source.CompositionTarget.TransformFromDevice.Transform(physicalDelta)
+                : physicalDelta;
+            Left = _dragStartLeft + logicalDelta.X;
+            Top = _dragStartTop + logicalDelta.Y;
+        }
+
+        private void WindowDragMouseUp(object sender, MouseButtonEventArgs eventArgs)
+        {
+            EndManualWindowDrag();
+        }
+
+        private void EndManualWindowDrag()
+        {
+            if (!_isWindowDragging) return;
+            _isWindowDragging = false;
+            if (Mouse.Captured == this) Mouse.Capture(null);
+        }
+
+        private static Style CreateItemContainerStyle()
+        {
+            Style style = new Style(typeof(ListBoxItem));
+            style.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(8, 6, 8, 6)));
+            style.Setters.Add(new Setter(Control.MarginProperty, new Thickness(0, 0, 0, 7)));
+            style.Setters.Add(new Setter(Control.HorizontalContentAlignmentProperty, HorizontalAlignment.Stretch));
+            style.Setters.Add(new Setter(Control.BackgroundProperty, Brushes.White));
+            style.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(1)));
+            style.Setters.Add(new Setter(Control.BorderBrushProperty, Brush("#FFE1E1E1")));
+
+            FrameworkElementFactory card = new FrameworkElementFactory(typeof(Border));
+            card.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Control.BackgroundProperty));
+            card.SetValue(Border.BorderBrushProperty, new TemplateBindingExtension(Control.BorderBrushProperty));
+            card.SetValue(Border.BorderThicknessProperty, new TemplateBindingExtension(Control.BorderThicknessProperty));
+            card.SetValue(Border.PaddingProperty, new TemplateBindingExtension(Control.PaddingProperty));
+            card.SetValue(Border.CornerRadiusProperty, new CornerRadius(8));
+            card.SetValue(Border.EffectProperty, new DropShadowEffect
+            {
+                BlurRadius = 7,
+                ShadowDepth = 2,
+                Opacity = 0.16,
+                Color = Colors.Black
+            });
+            FrameworkElementFactory presenter = new FrameworkElementFactory(typeof(ContentPresenter));
+            presenter.SetValue(ContentPresenter.ContentProperty, new TemplateBindingExtension(ContentControl.ContentProperty));
+            presenter.SetValue(ContentPresenter.ContentTemplateProperty, new TemplateBindingExtension(ContentControl.ContentTemplateProperty));
+            presenter.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Stretch);
+            card.AppendChild(presenter);
+            style.Setters.Add(new Setter(Control.TemplateProperty, new ControlTemplate(typeof(ListBoxItem)) { VisualTree = card }));
+
+            style.Triggers.Add(new Trigger
+            {
+                Property = ListBoxItem.IsMouseOverProperty,
+                Value = true,
+                Setters =
+                {
+                    new Setter(Control.BackgroundProperty, Brush("#FFF2F2F2")),
+                    new Setter(Control.BorderBrushProperty, Brush("#FFD5D5D5"))
+                }
+            });
+            style.Triggers.Add(new Trigger
+            {
+                Property = ListBoxItem.IsSelectedProperty,
+                Value = true,
+                Setters =
+                {
+                    new Setter(Control.BackgroundProperty, Brushes.White),
+                    new Setter(Control.BorderBrushProperty, Brush("#FF202020"))
+                }
+            });
+            return style;
+        }
+
+        private static Style CreateRoundedSearchBoxStyle()
+        {
+            Style style = new Style(typeof(TextBox));
+            style.Setters.Add(new Setter(Control.BackgroundProperty, Brushes.White));
+            style.Setters.Add(new Setter(Control.BorderBrushProperty, Brush("#FFD1D1D1")));
+            style.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(1)));
+
+            FrameworkElementFactory border = new FrameworkElementFactory(typeof(Border));
+            border.Name = "SearchBorder";
+            border.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Control.BackgroundProperty));
+            border.SetValue(Border.BorderBrushProperty, new TemplateBindingExtension(Control.BorderBrushProperty));
+            border.SetValue(Border.BorderThicknessProperty, new TemplateBindingExtension(Control.BorderThicknessProperty));
+            border.SetValue(Border.CornerRadiusProperty, new CornerRadius(8));
+            border.SetValue(Border.SnapsToDevicePixelsProperty, true);
+
+            FrameworkElementFactory contentGrid = new FrameworkElementFactory(typeof(Grid));
+
+            FrameworkElementFactory placeholder = new FrameworkElementFactory(typeof(TextBlock));
+            placeholder.Name = "SearchPlaceholder";
+            placeholder.SetValue(TextBlock.TextProperty, "搜索剪贴板");
+            placeholder.SetValue(TextBlock.ForegroundProperty, Brush("#FF8A8A8A"));
+            placeholder.SetValue(TextBlock.FontSizeProperty, 15.0);
+            placeholder.SetValue(FrameworkElement.MarginProperty, new TemplateBindingExtension(Control.PaddingProperty));
+            placeholder.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+            placeholder.SetValue(UIElement.IsHitTestVisibleProperty, false);
+            placeholder.SetValue(UIElement.VisibilityProperty, Visibility.Collapsed);
+            contentGrid.AppendChild(placeholder);
+
+            FrameworkElementFactory contentHost = new FrameworkElementFactory(typeof(ScrollViewer));
+            contentHost.Name = "PART_ContentHost";
+            contentHost.SetValue(FrameworkElement.MarginProperty, new TemplateBindingExtension(Control.PaddingProperty));
+            contentHost.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+            contentGrid.AppendChild(contentHost);
+            border.AppendChild(contentGrid);
+
+            ControlTemplate template = new ControlTemplate(typeof(TextBox)) { VisualTree = border };
+            Trigger focused = new Trigger
+            {
+                Property = UIElement.IsKeyboardFocusedProperty,
+                Value = true
+            };
+            focused.Setters.Add(new Setter(Border.BorderBrushProperty, Brush("#FF0078D4"), "SearchBorder"));
+            template.Triggers.Add(focused);
+            Trigger empty = new Trigger
+            {
+                Property = TextBox.TextProperty,
+                Value = string.Empty
+            };
+            empty.Setters.Add(new Setter(UIElement.VisibilityProperty, Visibility.Visible, "SearchPlaceholder"));
+            template.Triggers.Add(empty);
+            style.Setters.Add(new Setter(Control.TemplateProperty, template));
+            return style;
+        }
+    }
+}
