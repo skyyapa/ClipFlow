@@ -1061,7 +1061,7 @@ namespace ClipFlow
 
             Grid textCard = new Grid();
             textCard.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            textCard.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(34) });
+            textCard.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(66) });
             StackPanel stack = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
             stack.Children.Add(new TextBlock
             {
@@ -1079,6 +1079,12 @@ namespace ClipFlow
             });
             textCard.Children.Add(stack);
 
+            StackPanel textActions = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Center
+            };
             Button plainPaste = CreateCardIconButton("A", "纯文本粘贴");
             plainPaste.Content = new TextBlock
             {
@@ -1086,15 +1092,23 @@ namespace ClipFlow
                 FontWeight = FontWeights.SemiBold, Foreground = Brush("#FF3F5F7F")
             };
             plainPaste.ToolTip = "纯文本粘贴";
-            plainPaste.HorizontalAlignment = HorizontalAlignment.Right;
-            plainPaste.VerticalAlignment = VerticalAlignment.Center;
             plainPaste.Click += delegate(object sender, RoutedEventArgs eventArgs)
             {
                 PasteItem(item, true);
                 eventArgs.Handled = true;
             };
-            Grid.SetColumn(plainPaste, 1);
-            textCard.Children.Add(plainPaste);
+            Button textPin = CreateCardIconButton(item.IsFavorite ? "\uE77A" : "\uE718",
+                item.IsFavorite ? "取消收藏" : "收藏");
+            textPin.Click += delegate(object sender, RoutedEventArgs eventArgs)
+            {
+                _store.ToggleFavorite(item);
+                RefreshResults();
+                eventArgs.Handled = true;
+            };
+            textActions.Children.Add(plainPaste);
+            textActions.Children.Add(textPin);
+            Grid.SetColumn(textActions, 1);
+            textCard.Children.Add(textActions);
 
             return new ListBoxItem
             {
@@ -1172,7 +1186,7 @@ namespace ClipFlow
                     StrokeStartLineCap = PenLineCap.Round,
                     StrokeEndLineCap = PenLineCap.Round,
                     StrokeLineJoin = PenLineJoin.Round,
-                    Fill = accessibleName == "取消固定" ? Brush("#FF202020") : Brushes.Transparent,
+                    Fill = accessibleName.StartsWith("取消", StringComparison.Ordinal) ? Brush("#FF202020") : Brushes.Transparent,
                     Stretch = Stretch.Uniform,
                     Width = 16,
                     Height = 16,
