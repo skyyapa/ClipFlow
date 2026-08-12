@@ -95,6 +95,7 @@ namespace ClipFlow
             Grid topChrome = new Grid { Margin = new Thickness(4, 0, 2, 8), Background = Brushes.Transparent };
             topChrome.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             topChrome.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            topChrome.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             topChrome.MouseLeftButtonDown += delegate(object sender, MouseButtonEventArgs eventArgs)
             {
                 if (eventArgs.LeftButton != MouseButtonState.Pressed || IsInsideButton(eventArgs.OriginalSource as DependencyObject)) return;
@@ -111,12 +112,21 @@ namespace ClipFlow
             };
             pickerHeader.Children.Add(pickerTitle);
             topChrome.Children.Add(pickerHeader);
+            Button settingsButton = CreatePlainButton("\uE713");
+            settingsButton.FontFamily = new FontFamily("Segoe MDL2 Assets");
+            settingsButton.FontSize = 15;
+            settingsButton.Width = 30;
+            settingsButton.Height = 30;
+            settingsButton.ToolTip = "设置";
+            settingsButton.Click += delegate { ShowSettings(); };
+            Grid.SetColumn(settingsButton, 1);
+            topChrome.Children.Add(settingsButton);
             Button closeButton = CreatePlainButton("×");
             closeButton.FontSize = 21;
             closeButton.Width = 30;
             closeButton.Height = 30;
             closeButton.Click += delegate { Hide(); };
-            Grid.SetColumn(closeButton, 1);
+            Grid.SetColumn(closeButton, 2);
             topChrome.Children.Add(closeButton);
             layout.Children.Add(topChrome);
 
