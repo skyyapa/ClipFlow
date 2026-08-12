@@ -14,6 +14,7 @@ namespace ClipFlow
         [DataMember] public string Text { get; set; }
         [DataMember] public string Rtf { get; set; }
         [DataMember] public string Html { get; set; }
+        [DataMember] public string FilePathsText { get; set; }
         [DataMember] public string ContentType { get; set; }
         [DataMember] public string ImagePath { get; set; }
         [DataMember] public string ImageHash { get; set; }
@@ -32,6 +33,16 @@ namespace ClipFlow
         public bool IsImage
         {
             get { return string.Equals(ContentType, "Image", StringComparison.OrdinalIgnoreCase) || !string.IsNullOrEmpty(ImagePath); }
+        }
+
+        public bool IsFileList
+        {
+            get { return string.Equals(ContentType, "Files", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(FilePathsText); }
+        }
+
+        public string[] FilePaths
+        {
+            get { return string.IsNullOrEmpty(FilePathsText) ? new string[0] : FilePathsText.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries); }
         }
 
         public BitmapSource Thumbnail
@@ -106,6 +117,12 @@ namespace ClipFlow
             get
             {
                 if (IsImage) return "图片  " + ImageWidth + " × " + ImageHeight;
+                if (IsFileList)
+                {
+                    string[] paths = FilePaths;
+                    string name = paths.Length == 0 ? "文件" : Path.GetFileName(paths[0].TrimEnd(Path.DirectorySeparatorChar));
+                    return paths.Length > 1 ? name + "  等 " + paths.Length + " 个项目" : name;
+                }
                 string value = (Text ?? string.Empty).Replace("\r", " ").Replace("\n", " ").Replace("\t", " ").Trim();
                 while (value.Contains("  ")) value = value.Replace("  ", " ");
                 return value.Length > 120 ? value.Substring(0, 120) + "…" : value;

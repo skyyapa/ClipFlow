@@ -20,7 +20,7 @@ namespace ClipFlow
     {
         private const int MaximumItems = 5000;
         private const string Columns =
-            "id,text,rtf,html,content_type,image_path,image_hash,image_width,image_height," +
+            "id,text,rtf,html,file_paths,content_type,image_path,image_hash,image_width,image_height," +
             "source_app,source_title,created_at,last_used_at,use_count,copy_count,is_favorite";
 
         private readonly string _directory;
@@ -117,6 +117,42 @@ namespace ClipFlow
             }
         }
 
+        internal ClipboardItem AddOrRefreshFiles(IEnumerable<string> paths, string sourceApp, string sourceTitle)
+        {
+            string[] normalized = (paths ?? Enumerable.Empty<string>())
+                .Where(path => !string.IsNullOrWhiteSpace(path))
+                .Select(path => path.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (normalized.Length == 0) return null;
+            string serialized = string.Join("\n", normalized);
+            lock (_gate)
+            {
+                ClipboardItem existing = QueryOne(
+                    "SELECT " + Columns + " FROM items WHERE file_paths=? AND content_type='Files' LIMIT 1;", serialized);
+                DateTime now = DateTime.Now;
+                if (existing != null)
+                {
+                    existing.CreatedAt = now;
+                    existing.CopyCount++;
+                    existing.SourceApp = sourceApp;
+                    existing.SourceTitle = sourceTitle;
+                    UpdateItem(existing);
+                    return existing;
+                }
+
+                ClipboardItem created = new ClipboardItem
+                {
+                    Id = Guid.NewGuid().ToString("N"), ContentType = "Files", FilePathsText = serialized,
+                    SourceApp = sourceApp, SourceTitle = sourceTitle, CreatedAt = now,
+                    LastUsedAt = DateTime.MinValue, CopyCount = 1, UseCount = 0, IsFavorite = false
+                };
+                InsertItem(created);
+                Trim();
+                return created;
+            }
+        }
+
         internal List<ClipboardItem> Search(string query, int limit)
         {
             lock (_gate)
@@ -134,11 +170,13 @@ namespace ClipFlow
                 for (int index = 0; index < words.Length; index++)
                 {
                     if (index > 0) fuzzy.Append(" AND ");
-                    fuzzy.Append("(text LIKE ? ESCAPE '\\' COLLATE NOCASE OR source_app LIKE ? ESCAPE '\\' COLLATE NOCASE");
+                    fuzzy.Append("(text LIKE ? ESCAPE '\\' COLLATE NOCASE OR source_app LIKE ? ESCAPE '\\' COLLATE NOCASE OR file_paths LIKE ? ESCAPE '\\' COLLATE NOCASE");
                     string pattern = "%" + EscapeLike(words[index]) + "%";
                     parameters.Add(pattern);
                     parameters.Add(pattern);
+                    parameters.Add(pattern);
                     if (IsImageWord(words[index])) fuzzy.Append(" OR content_type='Image'");
+                    if (IsFileWord(words[index])) fuzzy.Append(" OR content_type='Files'");
                     fuzzy.Append(")");
                 }
 
@@ -202,26 +240,36 @@ namespace ClipFlow
         {
             _database.Execute("CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);");
             _database.Execute("CREATE TABLE IF NOT EXISTS items(" +
-                "id TEXT PRIMARY KEY NOT NULL,text TEXT,rtf TEXT,html TEXT,content_type TEXT NOT NULL," +
+                "id TEXT PRIMARY KEY NOT NULL,text TEXT,rtf TEXT,html TEXT,file_paths TEXT,content_type TEXT NOT NULL," +
                 "image_path TEXT,image_hash TEXT,image_width INTEGER NOT NULL DEFAULT 0,image_height INTEGER NOT NULL DEFAULT 0," +
                 "source_app TEXT,source_title TEXT,created_at INTEGER NOT NULL,last_used_at INTEGER NOT NULL," +
                 "use_count INTEGER NOT NULL DEFAULT 0,copy_count INTEGER NOT NULL DEFAULT 0,is_favorite INTEGER NOT NULL DEFAULT 0);");
+            try { _database.Execute("ALTER TABLE items ADD COLUMN file_paths TEXT;"); }
+            catch { }
             _database.Execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_items_image_hash ON items(image_hash) WHERE image_hash IS NOT NULL;");
             _database.Execute("CREATE INDEX IF NOT EXISTS ix_items_recent ON items(is_favorite DESC,created_at DESC);");
             _database.Execute("CREATE INDEX IF NOT EXISTS ix_items_source_app ON items(source_app);");
 
             try
             {
-                bool existed = Convert.ToInt64(_database.Scalar(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='items_fts';")) > 0;
-                _database.Execute("CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(text,source_app,content='items',content_rowid='rowid');");
+                string ftsSchema = Convert.ToString(_database.Scalar(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='items_fts';"));
+                bool existed = !string.IsNullOrEmpty(ftsSchema) && ftsSchema.IndexOf("file_paths", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (!existed && !string.IsNullOrEmpty(ftsSchema))
+                {
+                    _database.Execute("DROP TRIGGER IF EXISTS items_ai;");
+                    _database.Execute("DROP TRIGGER IF EXISTS items_ad;");
+                    _database.Execute("DROP TRIGGER IF EXISTS items_au;");
+                    _database.Execute("DROP TABLE IF EXISTS items_fts;");
+                }
+                _database.Execute("CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(text,source_app,file_paths,content='items',content_rowid='rowid');");
                 _database.Execute("CREATE TRIGGER IF NOT EXISTS items_ai AFTER INSERT ON items BEGIN " +
-                    "INSERT INTO items_fts(rowid,text,source_app) VALUES(new.rowid,coalesce(new.text,''),coalesce(new.source_app,'')); END;");
+                    "INSERT INTO items_fts(rowid,text,source_app,file_paths) VALUES(new.rowid,coalesce(new.text,''),coalesce(new.source_app,''),coalesce(new.file_paths,'')); END;");
                 _database.Execute("CREATE TRIGGER IF NOT EXISTS items_ad AFTER DELETE ON items BEGIN " +
-                    "INSERT INTO items_fts(items_fts,rowid,text,source_app) VALUES('delete',old.rowid,coalesce(old.text,''),coalesce(old.source_app,'')); END;");
-                _database.Execute("CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE OF text,source_app ON items BEGIN " +
-                    "INSERT INTO items_fts(items_fts,rowid,text,source_app) VALUES('delete',old.rowid,coalesce(old.text,''),coalesce(old.source_app,'')); " +
-                    "INSERT INTO items_fts(rowid,text,source_app) VALUES(new.rowid,coalesce(new.text,''),coalesce(new.source_app,'')); END;");
+                    "INSERT INTO items_fts(items_fts,rowid,text,source_app,file_paths) VALUES('delete',old.rowid,coalesce(old.text,''),coalesce(old.source_app,''),coalesce(old.file_paths,'')); END;");
+                _database.Execute("CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE OF text,source_app,file_paths ON items BEGIN " +
+                    "INSERT INTO items_fts(items_fts,rowid,text,source_app,file_paths) VALUES('delete',old.rowid,coalesce(old.text,''),coalesce(old.source_app,''),coalesce(old.file_paths,'')); " +
+                    "INSERT INTO items_fts(rowid,text,source_app,file_paths) VALUES(new.rowid,coalesce(new.text,''),coalesce(new.source_app,''),coalesce(new.file_paths,'')); END;");
                 if (!existed) _database.Execute("INSERT INTO items_fts(items_fts) VALUES('rebuild');");
                 _hasFts = true;
             }
@@ -256,7 +304,7 @@ namespace ClipFlow
                 foreach (ClipboardItem item in legacyItems)
                 {
                     if (string.IsNullOrEmpty(item.Id)) item.Id = Guid.NewGuid().ToString("N");
-                    _database.Execute("INSERT OR IGNORE INTO items(" + Columns + ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
+                    _database.Execute("INSERT OR IGNORE INTO items(" + Columns + ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
                         ItemValues(item));
                 }
                 _database.Execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('legacy_xml_imported',?);", DateTime.UtcNow.ToString("o"));
@@ -273,13 +321,13 @@ namespace ClipFlow
 
         private void InsertItem(ClipboardItem item)
         {
-            _database.Execute("INSERT INTO items(" + Columns + ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);", ItemValues(item));
+            _database.Execute("INSERT INTO items(" + Columns + ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);", ItemValues(item));
         }
 
         private void UpdateItem(ClipboardItem item)
         {
             object[] values = ItemValues(item).Skip(1).Concat(new object[] { item.Id }).ToArray();
-            _database.Execute("UPDATE items SET text=?,rtf=?,html=?,content_type=?,image_path=?,image_hash=?," +
+            _database.Execute("UPDATE items SET text=?,rtf=?,html=?,file_paths=?,content_type=?,image_path=?,image_hash=?," +
                 "image_width=?,image_height=?,source_app=?,source_title=?,created_at=?,last_used_at=?," +
                 "use_count=?,copy_count=?,is_favorite=? WHERE id=?;", values);
         }
@@ -337,7 +385,7 @@ namespace ClipFlow
         {
             return new object[]
             {
-                item.Id, item.Text, item.Rtf, item.Html, item.ContentType ?? (item.IsImage ? "Image" : "Text"),
+                item.Id, item.Text, item.Rtf, item.Html, item.FilePathsText, item.ContentType ?? (item.IsImage ? "Image" : "Text"),
                 item.ImagePath, item.ImageHash, item.ImageWidth, item.ImageHeight, item.SourceApp, item.SourceTitle,
                 ToStorageTime(item.CreatedAt), ToStorageTime(item.LastUsedAt), item.UseCount, item.CopyCount, item.IsFavorite
             };
@@ -349,12 +397,13 @@ namespace ClipFlow
             {
                 Id = SqliteDatabase.ColumnText(statement, 0), Text = SqliteDatabase.ColumnText(statement, 1),
                 Rtf = SqliteDatabase.ColumnText(statement, 2), Html = SqliteDatabase.ColumnText(statement, 3),
-                ContentType = SqliteDatabase.ColumnText(statement, 4), ImagePath = SqliteDatabase.ColumnText(statement, 5),
-                ImageHash = SqliteDatabase.ColumnText(statement, 6), ImageWidth = SqliteDatabase.ColumnInt(statement, 7),
-                ImageHeight = SqliteDatabase.ColumnInt(statement, 8), SourceApp = SqliteDatabase.ColumnText(statement, 9),
-                SourceTitle = SqliteDatabase.ColumnText(statement, 10), CreatedAt = FromStorageTime(SqliteDatabase.ColumnInt64(statement, 11)),
-                LastUsedAt = FromStorageTime(SqliteDatabase.ColumnInt64(statement, 12)), UseCount = SqliteDatabase.ColumnInt(statement, 13),
-                CopyCount = SqliteDatabase.ColumnInt(statement, 14), IsFavorite = SqliteDatabase.ColumnInt(statement, 15) != 0
+                FilePathsText = SqliteDatabase.ColumnText(statement, 4), ContentType = SqliteDatabase.ColumnText(statement, 5),
+                ImagePath = SqliteDatabase.ColumnText(statement, 6), ImageHash = SqliteDatabase.ColumnText(statement, 7),
+                ImageWidth = SqliteDatabase.ColumnInt(statement, 8), ImageHeight = SqliteDatabase.ColumnInt(statement, 9),
+                SourceApp = SqliteDatabase.ColumnText(statement, 10), SourceTitle = SqliteDatabase.ColumnText(statement, 11),
+                CreatedAt = FromStorageTime(SqliteDatabase.ColumnInt64(statement, 12)), LastUsedAt = FromStorageTime(SqliteDatabase.ColumnInt64(statement, 13)),
+                UseCount = SqliteDatabase.ColumnInt(statement, 14), CopyCount = SqliteDatabase.ColumnInt(statement, 15),
+                IsFavorite = SqliteDatabase.ColumnInt(statement, 16) != 0
             };
         }
 
@@ -374,6 +423,12 @@ namespace ClipFlow
         {
             string value = word.ToLowerInvariant();
             return value == "图片" || value == "截图" || value == "image" || value == "screenshot";
+        }
+
+        private static bool IsFileWord(string word)
+        {
+            string value = word.ToLowerInvariant();
+            return value == "文件" || value == "文件夹" || value == "file" || value == "folder";
         }
 
         private static string BuildFtsQuery(IEnumerable<string> words)

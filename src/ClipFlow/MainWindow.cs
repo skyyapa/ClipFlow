@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Specialized;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -25,6 +26,7 @@ namespace ClipFlow
         private readonly ListBox _resultsList;
         private readonly TextBlock _statusText;
         private readonly TextBlock _modeText;
+        private readonly Grid _resultsHost;
         private readonly Border _scrollThumb;
         private readonly DispatcherTimer _captureTimer;
         private readonly System.Windows.Forms.NotifyIcon _tray;
@@ -36,11 +38,15 @@ namespace ClipFlow
         private bool _isExiting;
         private string _selfWrittenText;
         private bool _selfWrittenImage;
+        private string _selfWrittenFiles;
         private DateTime _selfWriteExpires;
         private bool _isWindowDragging;
         private System.Drawing.Point _dragStartCursor;
         private double _dragStartLeft;
         private double _dragStartTop;
+        private bool _isScrollThumbDragging;
+        private double _scrollDragStartY;
+        private double _scrollDragStartOffset;
 
         internal MainWindow()
         {
@@ -197,24 +203,37 @@ namespace ClipFlow
             _resultsList.AddHandler(ScrollViewer.ScrollChangedEvent,
                 new ScrollChangedEventHandler(ResultsScrollChanged));
 
-            Grid resultsHost = new Grid();
-            resultsHost.Children.Add(_resultsList);
+            _resultsHost = new Grid();
+            _resultsHost.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            _resultsHost.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(10) });
+            _resultsHost.Children.Add(_resultsList);
             _scrollThumb = new Border
             {
-                Width = 3,
+                Width = 10,
                 MinHeight = 18,
-                Background = Brush("#8A6F6F6F"),
-                CornerRadius = new CornerRadius(1.5),
-                HorizontalAlignment = HorizontalAlignment.Right,
+                Background = Brushes.Transparent,
+                HorizontalAlignment = HorizontalAlignment.Center,
                 VerticalAlignment = VerticalAlignment.Top,
-                Margin = new Thickness(0, 9, 1, 0),
+                Margin = new Thickness(0, 9, 0, 0),
                 Visibility = Visibility.Collapsed,
-                IsHitTestVisible = false,
+                IsHitTestVisible = true,
+                Cursor = Cursors.SizeNS,
                 RenderTransform = new TranslateTransform()
             };
-            resultsHost.Children.Add(_scrollThumb);
-            Grid.SetRow(resultsHost, 3);
-            layout.Children.Add(resultsHost);
+            _scrollThumb.Child = new Border
+            {
+                Width = 4,
+                Background = Brush("#8A6F6F6F"),
+                CornerRadius = new CornerRadius(2),
+                HorizontalAlignment = HorizontalAlignment.Center
+            };
+            _scrollThumb.MouseLeftButtonDown += ScrollThumbMouseLeftButtonDown;
+            _scrollThumb.MouseMove += ScrollThumbMouseMove;
+            _scrollThumb.MouseLeftButtonUp += ScrollThumbMouseLeftButtonUp;
+            Grid.SetColumn(_scrollThumb, 1);
+            _resultsHost.Children.Add(_scrollThumb);
+            Grid.SetRow(_resultsHost, 3);
+            layout.Children.Add(_resultsHost);
 
             Grid footer = new Grid { Margin = new Thickness(2, 4, 2, 0) };
             footer.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -322,6 +341,26 @@ namespace ClipFlow
             _captureTimer.Stop();
             try
             {
+                if (Clipboard.ContainsFileDropList())
+                {
+                    StringCollection fileDrop = Clipboard.GetFileDropList();
+                    List<string> paths = new List<string>();
+                    foreach (string path in fileDrop) paths.Add(path);
+                    string serializedFiles = string.Join("\n", paths.ToArray());
+                    if (!string.IsNullOrEmpty(_selfWrittenFiles) && DateTime.Now <= _selfWriteExpires &&
+                        string.Equals(serializedFiles, _selfWrittenFiles, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _selfWrittenFiles = null;
+                        return;
+                    }
+                    string fileSourceApp;
+                    string fileSourceTitle;
+                    GetForegroundApp(out fileSourceApp, out fileSourceTitle);
+                    _store.AddOrRefreshFiles(paths, fileSourceApp, fileSourceTitle);
+                    if (IsVisible) RefreshResults();
+                    return;
+                }
+
                 BitmapSource image = TryGetClipboardImage();
                 if (image != null)
                 {
@@ -397,7 +436,24 @@ namespace ClipFlow
 
             try
             {
-                if (item.IsImage)
+                if (item.IsFileList)
+                {
+                    StringCollection files = new StringCollection();
+                    foreach (string path in item.FilePaths)
+                    {
+                        if (File.Exists(path) || Directory.Exists(path)) files.Add(path);
+                    }
+                    if (files.Count == 0)
+                    {
+                        _statusText.Text = "文件已被移动或删除";
+                        return;
+                    }
+                    _selfWrittenFiles = string.Join("\n", item.FilePaths);
+                    _selfWriteExpires = DateTime.Now.AddSeconds(2);
+                    Clipboard.SetFileDropList(files);
+                    _store.MarkUsed(item);
+                }
+                else if (item.IsImage)
                 {
                     BitmapSource bitmap = LoadBitmap(item.ImagePath);
                     if (bitmap == null)
@@ -637,7 +693,7 @@ namespace ClipFlow
                 return;
             }
 
-            double availableHeight = Math.Max(0, _resultsList.ActualHeight - 14);
+            double availableHeight = Math.Max(0, _resultsHost.ActualHeight - 18);
             double thumbHeight = Math.Max(18,
                 availableHeight * eventArgs.ViewportHeight / eventArgs.ExtentHeight);
             double travel = Math.Max(0, availableHeight - thumbHeight);
@@ -647,6 +703,38 @@ namespace ClipFlow
             TranslateTransform transform = _scrollThumb.RenderTransform as TranslateTransform;
             if (transform != null) transform.Y = offset;
             _scrollThumb.Visibility = Visibility.Visible;
+        }
+
+        private void ScrollThumbMouseLeftButtonDown(object sender, MouseButtonEventArgs eventArgs)
+        {
+            ScrollViewer viewer = FindVisualChild<ScrollViewer>(_resultsList);
+            if (viewer == null) return;
+            _isScrollThumbDragging = true;
+            _scrollDragStartY = eventArgs.GetPosition(_resultsHost).Y;
+            _scrollDragStartOffset = viewer.VerticalOffset;
+            _scrollThumb.CaptureMouse();
+            eventArgs.Handled = true;
+        }
+
+        private void ScrollThumbMouseMove(object sender, MouseEventArgs eventArgs)
+        {
+            if (!_isScrollThumbDragging || eventArgs.LeftButton != MouseButtonState.Pressed) return;
+            ScrollViewer viewer = FindVisualChild<ScrollViewer>(_resultsList);
+            if (viewer == null) return;
+            double availableHeight = Math.Max(0, _resultsHost.ActualHeight - 18);
+            double travel = Math.Max(1, availableHeight - _scrollThumb.ActualHeight);
+            double range = Math.Max(0, viewer.ExtentHeight - viewer.ViewportHeight);
+            double delta = eventArgs.GetPosition(_resultsHost).Y - _scrollDragStartY;
+            viewer.ScrollToVerticalOffset(Math.Max(0, Math.Min(range, _scrollDragStartOffset + delta * range / travel)));
+            eventArgs.Handled = true;
+        }
+
+        private void ScrollThumbMouseLeftButtonUp(object sender, MouseButtonEventArgs eventArgs)
+        {
+            if (!_isScrollThumbDragging) return;
+            _isScrollThumbDragging = false;
+            _scrollThumb.ReleaseMouseCapture();
+            eventArgs.Handled = true;
         }
 
         private void ResultsPreviewMouseWheel(object sender, MouseWheelEventArgs eventArgs)
@@ -757,6 +845,84 @@ namespace ClipFlow
 
         private ListBoxItem CreateResultListItem(ClipboardItem item)
         {
+            if (item.IsFileList)
+            {
+                string[] paths = item.FilePaths;
+                string firstPath = paths.Length == 0 ? string.Empty : paths[0];
+                bool exists = File.Exists(firstPath) || Directory.Exists(firstPath);
+                Grid fileCard = new Grid { Height = 62 };
+                fileCard.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(44) });
+                fileCard.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                fileCard.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(32) });
+
+                Border iconFrame = new Border
+                {
+                    Width = 36, Height = 36, CornerRadius = new CornerRadius(4),
+                    Background = Brush("#FFF0F0F0"), HorizontalAlignment = HorizontalAlignment.Left,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                BitmapSource fileIcon = LoadFileIcon(firstPath);
+                iconFrame.Child = fileIcon != null
+                    ? (UIElement)new Image { Source = fileIcon, Width = 28, Height = 28, Stretch = Stretch.Uniform }
+                    : new TextBlock
+                    {
+                        Text = Directory.Exists(firstPath) ? "\uE8B7" : "\uE8A5",
+                        FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 22,
+                        Foreground = Brush("#FF4F6F8F"), HorizontalAlignment = HorizontalAlignment.Center,
+                        VerticalAlignment = VerticalAlignment.Center
+                    };
+                fileCard.Children.Add(iconFrame);
+
+                StackPanel fileInfo = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+                fileInfo.Children.Add(new TextBlock
+                {
+                    Text = item.DisplayPreview, FontSize = 14, Foreground = exists ? Brush("#FF1A1A1A") : Brush("#FF8A8A8A"),
+                    TextTrimming = TextTrimming.CharacterEllipsis, ToolTip = firstPath
+                });
+                fileInfo.Children.Add(new TextBlock
+                {
+                    Text = exists ? item.Detail : "文件已被移动或删除",
+                    FontSize = 11, Foreground = exists ? Brush("#FF6E6E6E") : Brush("#FFB04A4A"),
+                    Margin = new Thickness(0, 4, 0, 0), TextTrimming = TextTrimming.CharacterEllipsis
+                });
+                Grid.SetColumn(fileInfo, 1);
+                fileCard.Children.Add(fileInfo);
+
+                Grid fileActions = new Grid();
+                fileActions.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                fileActions.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+                fileActions.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                Button moreButton = CreateCardIconButton("\uE712", "更多");
+                moreButton.Click += delegate
+                {
+                    ContextMenu menu = new ContextMenu();
+                    MenuItem open = new MenuItem { Header = "打开", IsEnabled = exists };
+                    MenuItem reveal = new MenuItem { Header = "打开所在位置", IsEnabled = exists };
+                    MenuItem favorite = new MenuItem { Header = item.IsFavorite ? "取消固定" : "固定" };
+                    MenuItem delete = new MenuItem { Header = "删除" };
+                    open.Click += delegate { OpenFilePath(firstPath); };
+                    reveal.Click += delegate { RevealFilePath(firstPath); };
+                    favorite.Click += delegate { _store.ToggleFavorite(item); RefreshResults(); };
+                    delete.Click += delegate { _store.Remove(item); RefreshResults(); };
+                    menu.Items.Add(open);
+                    menu.Items.Add(reveal);
+                    menu.Items.Add(new Separator());
+                    menu.Items.Add(favorite);
+                    menu.Items.Add(delete);
+                    moreButton.ContextMenu = menu;
+                    menu.IsOpen = true;
+                };
+                fileActions.Children.Add(moreButton);
+                Button pinButton = CreateCardIconButton(item.IsFavorite ? "\uE77A" : "\uE718", item.IsFavorite ? "取消固定" : "固定");
+                pinButton.Click += delegate { _store.ToggleFavorite(item); RefreshResults(); };
+                Grid.SetRow(pinButton, 2);
+                fileActions.Children.Add(pinButton);
+                Grid.SetColumn(fileActions, 2);
+                fileCard.Children.Add(fileActions);
+
+                return new ListBoxItem { Tag = item, Content = fileCard, HorizontalContentAlignment = HorizontalAlignment.Stretch };
+            }
+
             if (item.IsImage)
             {
                 Grid imageCard = new Grid { Height = 68 };
@@ -860,6 +1026,37 @@ namespace ClipFlow
                 Content = stack,
                 HorizontalContentAlignment = HorizontalAlignment.Stretch
             };
+        }
+
+        private static BitmapSource LoadFileIcon(string path)
+        {
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return null;
+            try
+            {
+                using (System.Drawing.Icon icon = System.Drawing.Icon.ExtractAssociatedIcon(path))
+                {
+                    if (icon == null) return null;
+                    BitmapSource source = Imaging.CreateBitmapSourceFromHIcon(icon.Handle, Int32Rect.Empty,
+                        BitmapSizeOptions.FromWidthAndHeight(32, 32));
+                    source.Freeze();
+                    return source;
+                }
+            }
+            catch { return null; }
+        }
+
+        private static void OpenFilePath(string path)
+        {
+            if (string.IsNullOrEmpty(path) || (!File.Exists(path) && !Directory.Exists(path))) return;
+            try { Process.Start(path); }
+            catch { }
+        }
+
+        private static void RevealFilePath(string path)
+        {
+            if (string.IsNullOrEmpty(path) || (!File.Exists(path) && !Directory.Exists(path))) return;
+            try { Process.Start("explorer.exe", "/select,\"" + path.Replace("\"", string.Empty) + "\""); }
+            catch { }
         }
 
         private static Button CreateCardIconButton(string glyph, string accessibleName)
