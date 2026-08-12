@@ -121,10 +121,14 @@ namespace ClipFlow
             settingsButton.Click += delegate { ShowSettings(); };
             Grid.SetColumn(settingsButton, 1);
             topChrome.Children.Add(settingsButton);
-            Button closeButton = CreatePlainButton("×");
-            closeButton.FontSize = 21;
+            Button closeButton = CreatePlainButton("\uE711");
+            closeButton.FontFamily = new FontFamily("Segoe MDL2 Assets");
+            closeButton.FontSize = 12;
             closeButton.Width = 30;
             closeButton.Height = 30;
+            closeButton.Padding = new Thickness(0);
+            closeButton.HorizontalContentAlignment = HorizontalAlignment.Center;
+            closeButton.VerticalContentAlignment = VerticalAlignment.Center;
             closeButton.Click += delegate { Hide(); };
             Grid.SetColumn(closeButton, 2);
             topChrome.Children.Add(closeButton);
