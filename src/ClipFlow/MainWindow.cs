@@ -297,6 +297,7 @@ namespace ClipFlow
             if (_source != null) _source.RemoveHook(WindowMessageHook);
             _tray.Visible = false;
             _tray.Dispose();
+            _store.Dispose();
             Application.Current.Shutdown();
         }
 

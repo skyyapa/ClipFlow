@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.Serialization;
 using System.Security.Cryptography;
+using System.Text;
 using System.Windows.Media.Imaging;
 
 namespace ClipFlow
@@ -12,22 +13,22 @@ namespace ClipFlow
     internal sealed class HistoryDocument
     {
         [DataMember] public List<ClipboardItem> Items { get; set; }
-
-        public HistoryDocument()
-        {
-            Items = new List<ClipboardItem>();
-        }
+        public HistoryDocument() { Items = new List<ClipboardItem>(); }
     }
 
-    internal sealed class HistoryStore
+    internal sealed class HistoryStore : IDisposable
     {
-        private readonly string _directory;
-        private readonly string _path;
-        private readonly string _imageDirectory;
-        private readonly DataContractSerializer _serializer;
-        private readonly object _gate = new object();
+        private const int MaximumItems = 5000;
+        private const string Columns =
+            "id,text,rtf,html,content_type,image_path,image_hash,image_width,image_height," +
+            "source_app,source_title,created_at,last_used_at,use_count,copy_count,is_favorite";
 
-        internal List<ClipboardItem> Items { get; private set; }
+        private readonly string _directory;
+        private readonly string _legacyPath;
+        private readonly string _imageDirectory;
+        private readonly SqliteDatabase _database;
+        private readonly object _gate = new object();
+        private bool _hasFts;
 
         internal HistoryStore()
         {
@@ -35,47 +36,41 @@ namespace ClipFlow
             _directory = string.IsNullOrWhiteSpace(overrideDirectory)
                 ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ClipFlow")
                 : overrideDirectory;
-            _path = Path.Combine(_directory, "history.xml");
+            _legacyPath = Path.Combine(_directory, "history.xml");
             _imageDirectory = Path.Combine(_directory, "images");
-            _serializer = new DataContractSerializer(typeof(HistoryDocument));
-            Items = Load();
+            Directory.CreateDirectory(_directory);
+            _database = new SqliteDatabase(Path.Combine(_directory, "clipflow.db"));
+            CreateSchema();
+            ImportLegacyHistory();
         }
 
         internal ClipboardItem AddOrRefresh(string text, string rtf, string html, string sourceApp, string sourceTitle)
         {
             lock (_gate)
             {
-                ClipboardItem existing = Items.FirstOrDefault(item => string.Equals(item.Text, text, StringComparison.Ordinal));
+                ClipboardItem existing = QueryOne("SELECT " + Columns + " FROM items WHERE text=? AND content_type='Text' LIMIT 1;", text);
+                DateTime now = DateTime.Now;
                 if (existing != null)
                 {
-                    existing.CreatedAt = DateTime.Now;
+                    existing.CreatedAt = now;
                     existing.CopyCount++;
                     existing.SourceApp = sourceApp;
                     existing.SourceTitle = sourceTitle;
                     if (!string.IsNullOrEmpty(rtf)) existing.Rtf = rtf;
                     if (!string.IsNullOrEmpty(html)) existing.Html = html;
-                    Save();
+                    UpdateItem(existing);
                     return existing;
                 }
 
                 ClipboardItem created = new ClipboardItem
                 {
-                    Id = Guid.NewGuid().ToString("N"),
-                    Text = text,
-                    Rtf = rtf,
-                    Html = html,
-                    ContentType = "Text",
-                    SourceApp = sourceApp,
-                    SourceTitle = sourceTitle,
-                    CreatedAt = DateTime.Now,
-                    LastUsedAt = DateTime.MinValue,
-                    CopyCount = 1,
-                    UseCount = 0,
-                    IsFavorite = false
+                    Id = Guid.NewGuid().ToString("N"), Text = text, Rtf = rtf, Html = html,
+                    ContentType = "Text", SourceApp = sourceApp, SourceTitle = sourceTitle,
+                    CreatedAt = now, LastUsedAt = DateTime.MinValue, CopyCount = 1,
+                    UseCount = 0, IsFavorite = false
                 };
-                Items.Add(created);
+                InsertItem(created);
                 Trim();
-                Save();
                 return created;
             }
         }
@@ -85,62 +80,39 @@ namespace ClipFlow
             if (bitmap == null) return null;
             lock (_gate)
             {
-                byte[] pngBytes;
-                FormatConvertedBitmap opaqueBitmap = new FormatConvertedBitmap();
-                opaqueBitmap.BeginInit();
-                opaqueBitmap.Source = bitmap;
-                opaqueBitmap.DestinationFormat = System.Windows.Media.PixelFormats.Bgr32;
-                opaqueBitmap.EndInit();
-                opaqueBitmap.Freeze();
-                PngBitmapEncoder encoder = new PngBitmapEncoder();
-                encoder.Frames.Add(BitmapFrame.Create(opaqueBitmap));
-                using (MemoryStream stream = new MemoryStream())
-                {
-                    encoder.Save(stream);
-                    pngBytes = stream.ToArray();
-                }
-
+                byte[] pngBytes = EncodeOpaquePng(bitmap);
                 string hash;
                 using (SHA256 sha = SHA256.Create())
                 {
                     hash = BitConverter.ToString(sha.ComputeHash(pngBytes)).Replace("-", string.Empty).ToLowerInvariant();
                 }
 
-                ClipboardItem existing = Items.FirstOrDefault(item =>
-                    item.IsImage && string.Equals(item.ImageHash, hash, StringComparison.OrdinalIgnoreCase));
+                ClipboardItem existing = QueryOne("SELECT " + Columns + " FROM items WHERE image_hash=? LIMIT 1;", hash);
+                DateTime now = DateTime.Now;
                 if (existing != null)
                 {
-                    existing.CreatedAt = DateTime.Now;
+                    existing.CreatedAt = now;
                     existing.CopyCount++;
                     existing.SourceApp = sourceApp;
                     existing.SourceTitle = sourceTitle;
-                    Save();
+                    UpdateItem(existing);
                     return existing;
                 }
 
                 Directory.CreateDirectory(_imageDirectory);
                 string imagePath = Path.Combine(_imageDirectory, hash + ".png");
                 if (!File.Exists(imagePath)) File.WriteAllBytes(imagePath, pngBytes);
-
                 ClipboardItem created = new ClipboardItem
                 {
-                    Id = Guid.NewGuid().ToString("N"),
-                    ContentType = "Image",
-                    ImagePath = imagePath,
-                    ImageHash = hash,
-                    ImageWidth = bitmap.PixelWidth,
-                    ImageHeight = bitmap.PixelHeight,
-                    SourceApp = sourceApp,
-                    SourceTitle = sourceTitle,
-                    CreatedAt = DateTime.Now,
-                    LastUsedAt = DateTime.MinValue,
-                    CopyCount = 1,
-                    UseCount = 0,
-                    IsFavorite = false
+                    Id = Guid.NewGuid().ToString("N"), ContentType = "Image",
+                    ImagePath = imagePath, ImageHash = hash,
+                    ImageWidth = bitmap.PixelWidth, ImageHeight = bitmap.PixelHeight,
+                    SourceApp = sourceApp, SourceTitle = sourceTitle,
+                    CreatedAt = now, LastUsedAt = DateTime.MinValue,
+                    CopyCount = 1, UseCount = 0, IsFavorite = false
                 };
-                Items.Add(created);
+                InsertItem(created);
                 Trim();
-                Save();
                 return created;
             }
         }
@@ -149,21 +121,36 @@ namespace ClipFlow
         {
             lock (_gate)
             {
-                IEnumerable<ClipboardItem> result = Items;
-                if (!string.IsNullOrWhiteSpace(query))
+                int safeLimit = Math.Max(1, Math.Min(limit, 500));
+                if (string.IsNullOrWhiteSpace(query))
                 {
-                    string[] words = query.Trim().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                    result = result.Where(item => words.All(word =>
-                        (item.Text ?? string.Empty).IndexOf(word, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        (item.SourceApp ?? string.Empty).IndexOf(word, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        (item.IsImage && ("图片 截图 image screenshot").IndexOf(word, StringComparison.OrdinalIgnoreCase) >= 0)));
+                    return _database.Query("SELECT " + Columns + " FROM items " +
+                        "ORDER BY is_favorite DESC, created_at DESC LIMIT ?;", ReadItem, safeLimit);
                 }
 
-                return result
-                    .OrderByDescending(item => item.IsFavorite)
-                    .ThenByDescending(item => item.CreatedAt)
-                    .Take(limit)
-                    .ToList();
+                string[] words = query.Trim().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                StringBuilder fuzzy = new StringBuilder();
+                List<object> parameters = new List<object>();
+                for (int index = 0; index < words.Length; index++)
+                {
+                    if (index > 0) fuzzy.Append(" AND ");
+                    fuzzy.Append("(text LIKE ? ESCAPE '\\' COLLATE NOCASE OR source_app LIKE ? ESCAPE '\\' COLLATE NOCASE");
+                    string pattern = "%" + EscapeLike(words[index]) + "%";
+                    parameters.Add(pattern);
+                    parameters.Add(pattern);
+                    if (IsImageWord(words[index])) fuzzy.Append(" OR content_type='Image'");
+                    fuzzy.Append(")");
+                }
+
+                string where = fuzzy.ToString();
+                if (_hasFts)
+                {
+                    where = "(rowid IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?) OR (" + where + "))";
+                    parameters.Insert(0, BuildFtsQuery(words));
+                }
+                parameters.Add(safeLimit);
+                return _database.Query("SELECT " + Columns + " FROM items WHERE " + where +
+                    " ORDER BY is_favorite DESC, created_at DESC LIMIT ?;", ReadItem, parameters.ToArray());
             }
         }
 
@@ -174,7 +161,8 @@ namespace ClipFlow
             {
                 item.LastUsedAt = DateTime.Now;
                 item.UseCount++;
-                Save();
+                _database.Execute("UPDATE items SET last_used_at=?,use_count=? WHERE id=?;",
+                    ToStorageTime(item.LastUsedAt), item.UseCount, item.Id);
             }
         }
 
@@ -184,7 +172,7 @@ namespace ClipFlow
             lock (_gate)
             {
                 item.IsFavorite = !item.IsFavorite;
-                Save();
+                _database.Execute("UPDATE items SET is_favorite=? WHERE id=?;", item.IsFavorite, item.Id);
             }
         }
 
@@ -193,9 +181,8 @@ namespace ClipFlow
             if (item == null) return;
             lock (_gate)
             {
-                Items.RemoveAll(value => value.Id == item.Id);
-                DeleteImageFileIfUnused(item);
-                Save();
+                _database.Execute("DELETE FROM items WHERE id=?;", item.Id);
+                DeleteImageFileIfUnused(item.ImagePath);
             }
         }
 
@@ -203,66 +190,197 @@ namespace ClipFlow
         {
             lock (_gate)
             {
-                List<ClipboardItem> removed = Items.Where(item => !item.IsFavorite).ToList();
-                Items.RemoveAll(item => !item.IsFavorite);
-                foreach (ClipboardItem item in removed) DeleteImageFileIfUnused(item);
-                Save();
+                List<string> imagePaths = _database.Query(
+                    "SELECT image_path FROM items WHERE is_favorite=0 AND image_path IS NOT NULL;",
+                    statement => SqliteDatabase.ColumnText(statement, 0));
+                _database.Execute("DELETE FROM items WHERE is_favorite=0;");
+                foreach (string path in imagePaths.Distinct(StringComparer.OrdinalIgnoreCase)) DeleteImageFileIfUnused(path);
             }
         }
 
-        private List<ClipboardItem> Load()
+        private void CreateSchema()
         {
+            _database.Execute("CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);");
+            _database.Execute("CREATE TABLE IF NOT EXISTS items(" +
+                "id TEXT PRIMARY KEY NOT NULL,text TEXT,rtf TEXT,html TEXT,content_type TEXT NOT NULL," +
+                "image_path TEXT,image_hash TEXT,image_width INTEGER NOT NULL DEFAULT 0,image_height INTEGER NOT NULL DEFAULT 0," +
+                "source_app TEXT,source_title TEXT,created_at INTEGER NOT NULL,last_used_at INTEGER NOT NULL," +
+                "use_count INTEGER NOT NULL DEFAULT 0,copy_count INTEGER NOT NULL DEFAULT 0,is_favorite INTEGER NOT NULL DEFAULT 0);");
+            _database.Execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_items_image_hash ON items(image_hash) WHERE image_hash IS NOT NULL;");
+            _database.Execute("CREATE INDEX IF NOT EXISTS ix_items_recent ON items(is_favorite DESC,created_at DESC);");
+            _database.Execute("CREATE INDEX IF NOT EXISTS ix_items_source_app ON items(source_app);");
+
             try
             {
-                if (!File.Exists(_path)) return new List<ClipboardItem>();
-                using (FileStream stream = File.OpenRead(_path))
+                bool existed = Convert.ToInt64(_database.Scalar(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='items_fts';")) > 0;
+                _database.Execute("CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(text,source_app,content='items',content_rowid='rowid');");
+                _database.Execute("CREATE TRIGGER IF NOT EXISTS items_ai AFTER INSERT ON items BEGIN " +
+                    "INSERT INTO items_fts(rowid,text,source_app) VALUES(new.rowid,coalesce(new.text,''),coalesce(new.source_app,'')); END;");
+                _database.Execute("CREATE TRIGGER IF NOT EXISTS items_ad AFTER DELETE ON items BEGIN " +
+                    "INSERT INTO items_fts(items_fts,rowid,text,source_app) VALUES('delete',old.rowid,coalesce(old.text,''),coalesce(old.source_app,'')); END;");
+                _database.Execute("CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE OF text,source_app ON items BEGIN " +
+                    "INSERT INTO items_fts(items_fts,rowid,text,source_app) VALUES('delete',old.rowid,coalesce(old.text,''),coalesce(old.source_app,'')); " +
+                    "INSERT INTO items_fts(rowid,text,source_app) VALUES(new.rowid,coalesce(new.text,''),coalesce(new.source_app,'')); END;");
+                if (!existed) _database.Execute("INSERT INTO items_fts(items_fts) VALUES('rebuild');");
+                _hasFts = true;
+            }
+            catch
+            {
+                _hasFts = false;
+            }
+        }
+
+        private void ImportLegacyHistory()
+        {
+            object imported = _database.Scalar("SELECT value FROM metadata WHERE key='legacy_xml_imported';");
+            if (imported != null || !File.Exists(_legacyPath)) return;
+
+            List<ClipboardItem> legacyItems;
+            try
+            {
+                DataContractSerializer serializer = new DataContractSerializer(typeof(HistoryDocument));
+                using (FileStream stream = File.OpenRead(_legacyPath))
                 {
-                    HistoryDocument document = (HistoryDocument)_serializer.ReadObject(stream);
-                    return document.Items ?? new List<ClipboardItem>();
+                    HistoryDocument document = (HistoryDocument)serializer.ReadObject(stream);
+                    legacyItems = document.Items ?? new List<ClipboardItem>();
                 }
             }
             catch
             {
-                return new List<ClipboardItem>();
+                return;
             }
+
+            _database.Transaction(delegate
+            {
+                foreach (ClipboardItem item in legacyItems)
+                {
+                    if (string.IsNullOrEmpty(item.Id)) item.Id = Guid.NewGuid().ToString("N");
+                    _database.Execute("INSERT OR IGNORE INTO items(" + Columns + ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
+                        ItemValues(item));
+                }
+                _database.Execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('legacy_xml_imported',?);", DateTime.UtcNow.ToString("o"));
+            });
+            Trim();
+
+            try
+            {
+                string backup = Path.Combine(_directory, "history.xml.migrated-backup");
+                if (!File.Exists(backup)) File.Move(_legacyPath, backup);
+            }
+            catch { }
+        }
+
+        private void InsertItem(ClipboardItem item)
+        {
+            _database.Execute("INSERT INTO items(" + Columns + ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);", ItemValues(item));
+        }
+
+        private void UpdateItem(ClipboardItem item)
+        {
+            object[] values = ItemValues(item).Skip(1).Concat(new object[] { item.Id }).ToArray();
+            _database.Execute("UPDATE items SET text=?,rtf=?,html=?,content_type=?,image_path=?,image_hash=?," +
+                "image_width=?,image_height=?,source_app=?,source_title=?,created_at=?,last_used_at=?," +
+                "use_count=?,copy_count=?,is_favorite=? WHERE id=?;", values);
+        }
+
+        private ClipboardItem QueryOne(string sql, params object[] values)
+        {
+            List<ClipboardItem> items = _database.Query(sql, ReadItem, values);
+            return items.Count == 0 ? null : items[0];
         }
 
         private void Trim()
         {
-            if (Items.Count <= 5000) return;
-            List<ClipboardItem> removable = Items
-                .Where(item => !item.IsFavorite)
-                .OrderBy(item => item.CreatedAt)
-                .Take(Items.Count - 5000)
-                .ToList();
+            long count = Convert.ToInt64(_database.Scalar("SELECT COUNT(*) FROM items;"));
+            long excess = count - MaximumItems;
+            if (excess <= 0) return;
+            List<ClipboardItem> removable = _database.Query(
+                "SELECT " + Columns + " FROM items WHERE is_favorite=0 ORDER BY created_at LIMIT ?;",
+                ReadItem, excess);
             foreach (ClipboardItem item in removable)
             {
-                Items.Remove(item);
-                DeleteImageFileIfUnused(item);
+                _database.Execute("DELETE FROM items WHERE id=?;", item.Id);
+                DeleteImageFileIfUnused(item.ImagePath);
             }
         }
 
-        private void DeleteImageFileIfUnused(ClipboardItem item)
+        private void DeleteImageFileIfUnused(string path)
         {
-            if (item == null || !item.IsImage || string.IsNullOrEmpty(item.ImagePath)) return;
-            bool stillUsed = Items.Any(value => string.Equals(value.ImagePath, item.ImagePath, StringComparison.OrdinalIgnoreCase));
-            if (!stillUsed && File.Exists(item.ImagePath))
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
+            long count = Convert.ToInt64(_database.Scalar("SELECT COUNT(*) FROM items WHERE image_path=?;", path));
+            if (count == 0)
             {
-                try { File.Delete(item.ImagePath); }
+                try { File.Delete(path); }
                 catch { }
             }
         }
 
-        private void Save()
+        private static byte[] EncodeOpaquePng(BitmapSource bitmap)
         {
-            Directory.CreateDirectory(_directory);
-            string temporary = _path + ".tmp";
-            using (FileStream stream = File.Create(temporary))
+            FormatConvertedBitmap opaque = new FormatConvertedBitmap();
+            opaque.BeginInit();
+            opaque.Source = bitmap;
+            opaque.DestinationFormat = System.Windows.Media.PixelFormats.Bgr32;
+            opaque.EndInit();
+            opaque.Freeze();
+            PngBitmapEncoder encoder = new PngBitmapEncoder();
+            encoder.Frames.Add(BitmapFrame.Create(opaque));
+            using (MemoryStream stream = new MemoryStream())
             {
-                _serializer.WriteObject(stream, new HistoryDocument { Items = Items });
+                encoder.Save(stream);
+                return stream.ToArray();
             }
-            if (File.Exists(_path)) File.Delete(_path);
-            File.Move(temporary, _path);
         }
+
+        private static object[] ItemValues(ClipboardItem item)
+        {
+            return new object[]
+            {
+                item.Id, item.Text, item.Rtf, item.Html, item.ContentType ?? (item.IsImage ? "Image" : "Text"),
+                item.ImagePath, item.ImageHash, item.ImageWidth, item.ImageHeight, item.SourceApp, item.SourceTitle,
+                ToStorageTime(item.CreatedAt), ToStorageTime(item.LastUsedAt), item.UseCount, item.CopyCount, item.IsFavorite
+            };
+        }
+
+        private static ClipboardItem ReadItem(IntPtr statement)
+        {
+            return new ClipboardItem
+            {
+                Id = SqliteDatabase.ColumnText(statement, 0), Text = SqliteDatabase.ColumnText(statement, 1),
+                Rtf = SqliteDatabase.ColumnText(statement, 2), Html = SqliteDatabase.ColumnText(statement, 3),
+                ContentType = SqliteDatabase.ColumnText(statement, 4), ImagePath = SqliteDatabase.ColumnText(statement, 5),
+                ImageHash = SqliteDatabase.ColumnText(statement, 6), ImageWidth = SqliteDatabase.ColumnInt(statement, 7),
+                ImageHeight = SqliteDatabase.ColumnInt(statement, 8), SourceApp = SqliteDatabase.ColumnText(statement, 9),
+                SourceTitle = SqliteDatabase.ColumnText(statement, 10), CreatedAt = FromStorageTime(SqliteDatabase.ColumnInt64(statement, 11)),
+                LastUsedAt = FromStorageTime(SqliteDatabase.ColumnInt64(statement, 12)), UseCount = SqliteDatabase.ColumnInt(statement, 13),
+                CopyCount = SqliteDatabase.ColumnInt(statement, 14), IsFavorite = SqliteDatabase.ColumnInt(statement, 15) != 0
+            };
+        }
+
+        private static long ToStorageTime(DateTime value) { return value.ToBinary(); }
+        private static DateTime FromStorageTime(long value)
+        {
+            try { return DateTime.FromBinary(value); }
+            catch { return DateTime.MinValue; }
+        }
+
+        private static string EscapeLike(string value)
+        {
+            return value.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
+        }
+
+        private static bool IsImageWord(string word)
+        {
+            string value = word.ToLowerInvariant();
+            return value == "图片" || value == "截图" || value == "image" || value == "screenshot";
+        }
+
+        private static string BuildFtsQuery(IEnumerable<string> words)
+        {
+            return string.Join(" AND ", words.Select(word => "\"" + word.Replace("\"", "\"\"") + "\"*"));
+        }
+
+        public void Dispose() { _database.Dispose(); }
     }
 }
