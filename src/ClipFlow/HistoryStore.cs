@@ -18,7 +18,6 @@ namespace ClipFlow
 
     internal sealed class HistoryStore : IDisposable
     {
-        private const int MaximumItems = 5000;
         private const string Columns =
             "id,text,rtf,html,file_paths,content_type,image_path,image_hash,image_width,image_height," +
             "source_app,source_title,created_at,last_used_at,use_count,copy_count,is_favorite";
@@ -28,10 +27,12 @@ namespace ClipFlow
         private readonly string _imageDirectory;
         private readonly SqliteDatabase _database;
         private readonly object _gate = new object();
+        private AppSettings _settings;
         private bool _hasFts;
 
-        internal HistoryStore()
+        internal HistoryStore(AppSettings settings)
         {
+            _settings = settings ?? AppSettings.Defaults();
             string overrideDirectory = Environment.GetEnvironmentVariable("CLIPFLOW_DATA_DIR");
             _directory = string.IsNullOrWhiteSpace(overrideDirectory)
                 ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ClipFlow")
@@ -42,6 +43,17 @@ namespace ClipFlow
             _database = new SqliteDatabase(Path.Combine(_directory, "clipflow.db"));
             CreateSchema();
             ImportLegacyHistory();
+            CleanupImages();
+        }
+
+        internal void ApplySettings(AppSettings settings)
+        {
+            lock (_gate)
+            {
+                _settings = settings ?? AppSettings.Defaults();
+                Trim();
+                CleanupImages();
+            }
         }
 
         internal ClipboardItem AddOrRefresh(string text, string rtf, string html, string sourceApp, string sourceTitle)
@@ -113,6 +125,7 @@ namespace ClipFlow
                 };
                 InsertItem(created);
                 Trim();
+                CleanupImages();
                 return created;
             }
         }
@@ -341,7 +354,7 @@ namespace ClipFlow
         private void Trim()
         {
             long count = Convert.ToInt64(_database.Scalar("SELECT COUNT(*) FROM items;"));
-            long excess = count - MaximumItems;
+            long excess = count - _settings.MaximumItems;
             if (excess <= 0) return;
             List<ClipboardItem> removable = _database.Query(
                 "SELECT " + Columns + " FROM items WHERE is_favorite=0 ORDER BY created_at LIMIT ?;",
@@ -350,6 +363,47 @@ namespace ClipFlow
             {
                 _database.Execute("DELETE FROM items WHERE id=?;", item.Id);
                 DeleteImageFileIfUnused(item.ImagePath);
+            }
+        }
+
+        internal void CleanupImages()
+        {
+            lock (_gate)
+            {
+                List<ClipboardItem> images = _database.Query(
+                    "SELECT " + Columns + " FROM items WHERE content_type='Image' AND is_favorite=0 ORDER BY created_at ASC;", ReadItem);
+                DateTime cutoff = _settings.ImageRetentionDays <= 0
+                    ? DateTime.MinValue : DateTime.Now.AddDays(-_settings.ImageRetentionDays);
+                foreach (ClipboardItem item in images.Where(item => item.CreatedAt < cutoff).ToList())
+                {
+                    _database.Execute("DELETE FROM items WHERE id=?;", item.Id);
+                    DeleteImageFileIfUnused(item.ImagePath);
+                    images.Remove(item);
+                }
+
+                long maximumBytes = (long)_settings.ImageMaximumMegabytes * 1024L * 1024L;
+                long totalBytes = images.Sum(item => SafeFileLength(item.ImagePath));
+                foreach (ClipboardItem item in images)
+                {
+                    if (totalBytes <= maximumBytes) break;
+                    long length = SafeFileLength(item.ImagePath);
+                    _database.Execute("DELETE FROM items WHERE id=?;", item.Id);
+                    DeleteImageFileIfUnused(item.ImagePath);
+                    totalBytes -= length;
+                }
+
+                if (Directory.Exists(_imageDirectory))
+                {
+                    HashSet<string> referenced = new HashSet<string>(_database.Query(
+                        "SELECT image_path FROM items WHERE image_path IS NOT NULL;",
+                        statement => SqliteDatabase.ColumnText(statement, 0)), StringComparer.OrdinalIgnoreCase);
+                    foreach (string path in Directory.GetFiles(_imageDirectory, "*.png"))
+                    {
+                        if (referenced.Contains(path)) continue;
+                        try { File.Delete(path); }
+                        catch { }
+                    }
+                }
             }
         }
 
@@ -379,6 +433,12 @@ namespace ClipFlow
                 encoder.Save(stream);
                 return stream.ToArray();
             }
+        }
+
+        private static long SafeFileLength(string path)
+        {
+            try { return string.IsNullOrEmpty(path) || !File.Exists(path) ? 0 : new FileInfo(path).Length; }
+            catch { return 0; }
         }
 
         private static object[] ItemValues(ClipboardItem item)

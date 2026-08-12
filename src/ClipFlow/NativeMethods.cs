@@ -9,6 +9,7 @@ namespace ClipFlow
         internal const int WM_CLIPBOARDUPDATE = 0x031D;
         internal const int WM_HOTKEY = 0x0312;
         internal const uint MOD_CONTROL = 0x0002;
+        internal const uint MOD_ALT = 0x0001;
         internal const uint MOD_SHIFT = 0x0004;
         internal const uint KEYEVENTF_KEYUP = 0x0002;
         internal const byte VK_CONTROL = 0x11;

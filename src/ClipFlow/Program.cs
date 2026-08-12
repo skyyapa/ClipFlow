@@ -29,6 +29,10 @@ namespace ClipFlow
             {
                 application.Dispatcher.BeginInvoke(new Action(window.ShowPalette));
             }
+            if (args != null && Array.IndexOf(args, "--settings") >= 0)
+            {
+                application.Dispatcher.BeginInvoke(new Action(window.ShowSettings));
+            }
             application.Run();
 
             _mutex.ReleaseMutex();

@@ -21,6 +21,8 @@ namespace ClipFlow
     internal sealed class MainWindow : Window
     {
         private const int HotkeyId = 17031;
+        private readonly SettingsStore _settingsStore;
+        private AppSettings _settings;
         private readonly HistoryStore _store;
         private readonly TextBox _searchBox;
         private readonly ListBox _resultsList;
@@ -36,6 +38,7 @@ namespace ClipFlow
         private int _captureAttempts;
         private bool _isPaused;
         private bool _isExiting;
+        private bool _hotkeyRegistered;
         private string _selfWrittenText;
         private bool _selfWrittenImage;
         private string _selfWrittenFiles;
@@ -50,7 +53,9 @@ namespace ClipFlow
 
         internal MainWindow()
         {
-            _store = new HistoryStore();
+            _settingsStore = new SettingsStore();
+            _settings = _settingsStore.Load();
+            _store = new HistoryStore(_settings);
 
             Title = "ClipFlow";
             Width = 372;
@@ -278,14 +283,13 @@ namespace ClipFlow
             _source.AddHook(WindowMessageHook);
 
             NativeMethods.AddClipboardFormatListener(_handle);
-            bool hotkeyReady = NativeMethods.RegisterHotKey(_handle, HotkeyId,
-                NativeMethods.MOD_CONTROL | NativeMethods.MOD_SHIFT, NativeMethods.VK_V);
+            bool hotkeyReady = RegisterConfiguredHotkey();
 
             _tray.Visible = true;
             if (!hotkeyReady)
             {
                 _tray.ShowBalloonTip(4000, "ClipFlow",
-                    "Ctrl+Shift+V 已被其他程序占用。可从托盘打开 ClipFlow。",
+                    GetHotkeyDisplay() + " 已被其他程序占用。可从托盘打开 ClipFlow。",
                     System.Windows.Forms.ToolTipIcon.Warning);
             }
             RefreshResults();
@@ -311,7 +315,7 @@ namespace ClipFlow
             if (_handle != IntPtr.Zero)
             {
                 NativeMethods.RemoveClipboardFormatListener(_handle);
-                NativeMethods.UnregisterHotKey(_handle, HotkeyId);
+                if (_hotkeyRegistered) NativeMethods.UnregisterHotKey(_handle, HotkeyId);
             }
             if (_source != null) _source.RemoveHook(WindowMessageHook);
             _tray.Visible = false;
@@ -432,6 +436,11 @@ namespace ClipFlow
         private void PasteSelected(bool plainTextOnly)
         {
             ClipboardItem item = GetSelectedItem();
+            PasteItem(item, plainTextOnly);
+        }
+
+        private void PasteItem(ClipboardItem item, bool plainTextOnly)
+        {
             if (item == null) return;
 
             try
@@ -792,6 +801,7 @@ namespace ClipFlow
             System.Windows.Forms.ContextMenuStrip menu = new System.Windows.Forms.ContextMenuStrip();
             System.Windows.Forms.ToolStripMenuItem open = new System.Windows.Forms.ToolStripMenuItem("打开 ClipFlow");
             System.Windows.Forms.ToolStripMenuItem pause = new System.Windows.Forms.ToolStripMenuItem("暂停记录");
+            System.Windows.Forms.ToolStripMenuItem settings = new System.Windows.Forms.ToolStripMenuItem("设置…");
             System.Windows.Forms.ToolStripMenuItem clear = new System.Windows.Forms.ToolStripMenuItem("清空未收藏历史");
             System.Windows.Forms.ToolStripMenuItem exit = new System.Windows.Forms.ToolStripMenuItem("退出");
             open.Click += delegate { Dispatcher.BeginInvoke(new Action(ShowPalette)); };
@@ -801,6 +811,7 @@ namespace ClipFlow
                 pause.Text = _isPaused ? "恢复记录" : "暂停记录";
                 Dispatcher.BeginInvoke(new Action(RefreshResults));
             };
+            settings.Click += delegate { Dispatcher.BeginInvoke(new Action(ShowSettings)); };
             clear.Click += delegate
             {
                 Dispatcher.BeginInvoke(new Action(delegate
@@ -817,12 +828,56 @@ namespace ClipFlow
             exit.Click += delegate { Dispatcher.BeginInvoke(new Action(ExitApplication)); };
             menu.Items.Add(open);
             menu.Items.Add(pause);
+            menu.Items.Add(settings);
             menu.Items.Add(clear);
             menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
             menu.Items.Add(exit);
             tray.ContextMenuStrip = menu;
             tray.DoubleClick += delegate { Dispatcher.BeginInvoke(new Action(ShowPalette)); };
             return tray;
+        }
+
+        internal void ShowSettings()
+        {
+            SettingsWindow window = new SettingsWindow(_settings) { Topmost = true };
+            if (window.ShowDialog() != true || window.Result == null) return;
+            AppSettings previous = _settings;
+            _settings = window.Result;
+            _settingsStore.Save(_settings);
+            _store.ApplySettings(_settings);
+
+            if (_hotkeyRegistered)
+            {
+                NativeMethods.UnregisterHotKey(_handle, HotkeyId);
+                _hotkeyRegistered = false;
+            }
+            if (!RegisterConfiguredHotkey())
+            {
+                _settings.HotkeyModifiers = previous.HotkeyModifiers;
+                _settings.HotkeyKey = previous.HotkeyKey;
+                _settingsStore.Save(_settings);
+                RegisterConfiguredHotkey();
+                MessageBox.Show("新快捷键已被其他程序占用，已恢复为 " + GetHotkeyDisplay() + "。",
+                    "ClipFlow", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+            RefreshResults();
+        }
+
+        private bool RegisterConfiguredHotkey()
+        {
+            uint modifiers = _settings.HotkeyModifiers == "Ctrl+Alt"
+                ? NativeMethods.MOD_CONTROL | NativeMethods.MOD_ALT
+                : _settings.HotkeyModifiers == "Alt+Shift"
+                    ? NativeMethods.MOD_ALT | NativeMethods.MOD_SHIFT
+                    : NativeMethods.MOD_CONTROL | NativeMethods.MOD_SHIFT;
+            char key = string.IsNullOrEmpty(_settings.HotkeyKey) ? 'V' : char.ToUpperInvariant(_settings.HotkeyKey[0]);
+            _hotkeyRegistered = NativeMethods.RegisterHotKey(_handle, HotkeyId, modifiers, (uint)key);
+            return _hotkeyRegistered;
+        }
+
+        private string GetHotkeyDisplay()
+        {
+            return _settings.HotkeyModifiers + "+" + _settings.HotkeyKey;
         }
 
         private void WindowClosing(object sender, System.ComponentModel.CancelEventArgs eventArgs)
@@ -1004,7 +1059,10 @@ namespace ClipFlow
                 };
             }
 
-            StackPanel stack = new StackPanel();
+            Grid textCard = new Grid();
+            textCard.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            textCard.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(34) });
+            StackPanel stack = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
             stack.Children.Add(new TextBlock
             {
                 Text = item.DisplayPreview,
@@ -1019,11 +1077,29 @@ namespace ClipFlow
                 Foreground = Brush("#FF6E6E6E"),
                 Margin = new Thickness(0, 5, 0, 0)
             });
+            textCard.Children.Add(stack);
+
+            Button plainPaste = CreateCardIconButton("A", "纯文本粘贴");
+            plainPaste.Content = new TextBlock
+            {
+                Text = "A", FontFamily = new FontFamily("Segoe UI"), FontSize = 13,
+                FontWeight = FontWeights.SemiBold, Foreground = Brush("#FF3F5F7F")
+            };
+            plainPaste.ToolTip = "纯文本粘贴";
+            plainPaste.HorizontalAlignment = HorizontalAlignment.Right;
+            plainPaste.VerticalAlignment = VerticalAlignment.Center;
+            plainPaste.Click += delegate(object sender, RoutedEventArgs eventArgs)
+            {
+                PasteItem(item, true);
+                eventArgs.Handled = true;
+            };
+            Grid.SetColumn(plainPaste, 1);
+            textCard.Children.Add(plainPaste);
 
             return new ListBoxItem
             {
                 Tag = item,
-                Content = stack,
+                Content = textCard,
                 HorizontalContentAlignment = HorizontalAlignment.Stretch
             };
         }
