@@ -90,15 +90,17 @@ namespace ClipFlow
         internal ClipboardItem AddOrRefreshImage(BitmapSource bitmap, string sourceApp, string sourceTitle)
         {
             if (bitmap == null) return null;
+            byte[] pngBytes = EncodeOpaquePng(bitmap);
+            string hash;
+            using (SHA256 sha = SHA256.Create())
+            {
+                hash = BitConverter.ToString(sha.ComputeHash(pngBytes)).Replace("-", string.Empty).ToLowerInvariant();
+            }
+
+            ClipboardItem result;
+            bool createdNew = false;
             lock (_gate)
             {
-                byte[] pngBytes = EncodeOpaquePng(bitmap);
-                string hash;
-                using (SHA256 sha = SHA256.Create())
-                {
-                    hash = BitConverter.ToString(sha.ComputeHash(pngBytes)).Replace("-", string.Empty).ToLowerInvariant();
-                }
-
                 ClipboardItem existing = QueryOne("SELECT " + Columns + " FROM items WHERE image_hash=? LIMIT 1;", hash);
                 DateTime now = DateTime.Now;
                 if (existing != null)
@@ -125,9 +127,11 @@ namespace ClipFlow
                 };
                 InsertItem(created);
                 Trim();
-                CleanupImages();
-                return created;
+                result = created;
+                createdNew = true;
             }
+            if (createdNew) CleanupImages();
+            return result;
         }
 
         internal ClipboardItem AddOrRefreshFiles(IEnumerable<string> paths, string sourceApp, string sourceTitle)
@@ -202,6 +206,43 @@ namespace ClipFlow
                 parameters.Add(safeLimit);
                 return _database.Query("SELECT " + Columns + " FROM items WHERE " + where +
                     " ORDER BY is_favorite DESC, created_at DESC LIMIT ?;", ReadItem, parameters.ToArray());
+            }
+        }
+
+        internal List<ClipboardItem> SearchInvalidFiles(int limit)
+        {
+            lock (_gate)
+            {
+                List<ClipboardItem> files = _database.Query("SELECT " + Columns +
+                    " FROM items WHERE content_type='Files' ORDER BY is_favorite DESC,created_at DESC;", ReadItem);
+                return files.Where(item => item.HasInvalidFilePaths).Take(Math.Max(1, limit)).ToList();
+            }
+        }
+
+        internal int RemoveInvalidFiles()
+        {
+            lock (_gate)
+            {
+                List<ClipboardItem> invalid = _database.Query("SELECT " + Columns +
+                    " FROM items WHERE content_type='Files' AND is_favorite=0;", ReadItem)
+                    .Where(item => item.HasInvalidFilePaths).ToList();
+                foreach (ClipboardItem item in invalid) _database.Execute("DELETE FROM items WHERE id=?;", item.Id);
+                return invalid.Count;
+            }
+        }
+
+        internal void ReplaceFilePath(ClipboardItem item, string oldPath, string newPath)
+        {
+            if (item == null || !item.IsFileList || string.IsNullOrWhiteSpace(oldPath) || string.IsNullOrWhiteSpace(newPath)) return;
+            lock (_gate)
+            {
+                string[] paths = item.FilePaths;
+                for (int index = 0; index < paths.Length; index++)
+                {
+                    if (string.Equals(paths[index], oldPath, StringComparison.OrdinalIgnoreCase)) paths[index] = newPath;
+                }
+                item.FilePathsText = string.Join("\n", paths.Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
+                UpdateItem(item);
             }
         }
 

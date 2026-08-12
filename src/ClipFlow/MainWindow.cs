@@ -24,6 +24,7 @@ namespace ClipFlow
         private readonly SettingsStore _settingsStore;
         private AppSettings _settings;
         private readonly HistoryStore _store;
+        private readonly StorageWorkQueue _storageQueue;
         private readonly TextBox _searchBox;
         private readonly ListBox _resultsList;
         private readonly TextBlock _statusText;
@@ -32,6 +33,8 @@ namespace ClipFlow
         private readonly Border _scrollThumb;
         private readonly DispatcherTimer _captureTimer;
         private readonly System.Windows.Forms.NotifyIcon _tray;
+        private readonly Button _invalidFilterButton;
+        private readonly Button _clearButton;
         private HwndSource _source;
         private IntPtr _handle;
         private IntPtr _returnWindow;
@@ -39,6 +42,7 @@ namespace ClipFlow
         private bool _isPaused;
         private bool _isExiting;
         private bool _hotkeyRegistered;
+        private bool _showInvalidFiles;
         private string _selfWrittenText;
         private bool _selfWrittenImage;
         private string _selfWrittenFiles;
@@ -56,6 +60,8 @@ namespace ClipFlow
             _settingsStore = new SettingsStore();
             _settings = _settingsStore.Load();
             _store = new HistoryStore(_settings);
+            _storageQueue = new StorageWorkQueue();
+            _storageQueue.Failed += StorageQueueFailed;
 
             Title = "ClipFlow";
             Width = 372;
@@ -163,7 +169,28 @@ namespace ClipFlow
             brand.Children.Add(_modeText);
             header.Children.Add(brand);
 
-            Button clearAll = new Button
+            StackPanel headerActions = new StackPanel { Orientation = Orientation.Horizontal };
+            _invalidFilterButton = new Button
+            {
+                Content = "失效文件",
+                Foreground = Brush("#FF545454"),
+                Background = Brushes.Transparent,
+                BorderThickness = new Thickness(0),
+                Padding = new Thickness(7, 5, 7, 5),
+                Margin = new Thickness(0, 0, 3, 0),
+                VerticalAlignment = VerticalAlignment.Center,
+                ToolTip = "查看已移动或删除的文件"
+            };
+            _invalidFilterButton.Click += delegate
+            {
+                _showInvalidFiles = !_showInvalidFiles;
+                _invalidFilterButton.Content = _showInvalidFiles ? "全部记录" : "失效文件";
+                _clearButton.Content = _showInvalidFiles ? "清理失效" : "全部清除";
+                RefreshResults();
+            };
+            headerActions.Children.Add(_invalidFilterButton);
+
+            _clearButton = new Button
             {
                 Content = "全部清除",
                 Foreground = Brush("#FF252525"),
@@ -173,18 +200,36 @@ namespace ClipFlow
                 Padding = new Thickness(10, 5, 10, 5),
                 VerticalAlignment = VerticalAlignment.Center
             };
-            clearAll.Click += delegate
+            _clearButton.Click += delegate
             {
-                MessageBoxResult choice = MessageBox.Show("清空所有未固定的剪贴板历史？", "ClipFlow",
+                string prompt = _showInvalidFiles
+                    ? "清理所有未收藏的失效文件记录？收藏的记录会保留。"
+                    : "清空所有未固定的剪贴板历史？";
+                MessageBoxResult choice = MessageBox.Show(prompt, "ClipFlow",
                     MessageBoxButton.YesNo, MessageBoxImage.Question);
                 if (choice == MessageBoxResult.Yes)
                 {
-                    _store.ClearUnfavorited();
-                    RefreshResults();
+                    if (_showInvalidFiles)
+                    {
+                        _storageQueue.Enqueue(delegate
+                        {
+                            int removed = _store.RemoveInvalidFiles();
+                            NotifyStorageChanged(removed + " 条失效记录已清理");
+                        });
+                    }
+                    else
+                    {
+                        _storageQueue.Enqueue(delegate
+                        {
+                            _store.ClearUnfavorited();
+                            NotifyStorageChanged(null);
+                        });
+                    }
                 }
             };
-            Grid.SetColumn(clearAll, 1);
-            header.Children.Add(clearAll);
+            headerActions.Children.Add(_clearButton);
+            Grid.SetColumn(headerActions, 1);
+            header.Children.Add(headerActions);
             Grid.SetRow(header, 1);
             layout.Children.Add(header);
 
@@ -334,6 +379,7 @@ namespace ClipFlow
             if (_source != null) _source.RemoveHook(WindowMessageHook);
             _tray.Visible = false;
             _tray.Dispose();
+            _storageQueue.Dispose();
             _store.Dispose();
             Application.Current.Shutdown();
         }
@@ -374,8 +420,12 @@ namespace ClipFlow
                     string fileSourceApp;
                     string fileSourceTitle;
                     GetForegroundApp(out fileSourceApp, out fileSourceTitle);
-                    _store.AddOrRefreshFiles(paths, fileSourceApp, fileSourceTitle);
-                    if (IsVisible) RefreshResults();
+                    string[] capturedPaths = paths.ToArray();
+                    _storageQueue.Enqueue(delegate
+                    {
+                        _store.AddOrRefreshFiles(capturedPaths, fileSourceApp, fileSourceTitle);
+                        NotifyStorageChanged(null);
+                    });
                     return;
                 }
 
@@ -391,8 +441,13 @@ namespace ClipFlow
                     string imageSourceApp;
                     string imageSourceTitle;
                     GetForegroundApp(out imageSourceApp, out imageSourceTitle);
-                    _store.AddOrRefreshImage(image, imageSourceApp, imageSourceTitle);
-                    if (IsVisible) RefreshResults();
+                    BitmapSource capturedImage = image.IsFrozen ? image : image.Clone();
+                    if (!capturedImage.IsFrozen) capturedImage.Freeze();
+                    _storageQueue.Enqueue(delegate
+                    {
+                        _store.AddOrRefreshImage(capturedImage, imageSourceApp, imageSourceTitle);
+                        NotifyStorageChanged(null);
+                    });
                     return;
                 }
 
@@ -412,8 +467,11 @@ namespace ClipFlow
                 string sourceApp;
                 string sourceTitle;
                 GetForegroundApp(out sourceApp, out sourceTitle);
-                _store.AddOrRefresh(text, rtf, html, sourceApp, sourceTitle);
-                if (IsVisible) RefreshResults();
+                _storageQueue.Enqueue(delegate
+                {
+                    _store.AddOrRefresh(text, rtf, html, sourceApp, sourceTitle);
+                    NotifyStorageChanged(null);
+                });
             }
             catch (ExternalException)
             {
@@ -432,7 +490,9 @@ namespace ClipFlow
         private void RefreshResults()
         {
             ClipboardItem selected = GetSelectedItem();
-            List<ClipboardItem> results = _store.Search(_searchBox.Text, 100);
+            List<ClipboardItem> results = _showInvalidFiles
+                ? _store.SearchInvalidFiles(100)
+                : _store.Search(_searchBox.Text, 100);
             _resultsList.Items.Clear();
             foreach (ClipboardItem item in results)
             {
@@ -443,8 +503,25 @@ namespace ClipFlow
                 int index = selected == null ? 0 : results.FindIndex(item => item.Id == selected.Id);
                 _resultsList.SelectedIndex = index >= 0 ? index : 0;
             }
-            _statusText.Text = results.Count.ToString() + " 条结果" + (_isPaused ? "  ·  已暂停记录" : string.Empty);
+            _statusText.Text = results.Count.ToString() + (_showInvalidFiles ? " 条失效文件" : " 条结果") +
+                (_isPaused ? "  ·  已暂停记录" : string.Empty);
             _modeText.Text = _isPaused ? "  已暂停" : string.Empty;
+        }
+
+        private void NotifyStorageChanged(string message)
+        {
+            if (_isExiting) return;
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                if (_isExiting) return;
+                if (IsVisible) RefreshResults();
+                if (!string.IsNullOrEmpty(message)) _statusText.Text = message;
+            }));
+        }
+
+        private void StorageQueueFailed(Exception exception)
+        {
+            NotifyStorageChanged("保存失败，请稍后重试");
         }
 
         private void PasteSelected(bool plainTextOnly)
@@ -858,7 +935,12 @@ namespace ClipFlow
             AppSettings previous = _settings;
             _settings = window.Result;
             _settingsStore.Save(_settings);
-            _store.ApplySettings(_settings);
+            AppSettings settingsToApply = _settings;
+            _storageQueue.Enqueue(delegate
+            {
+                _store.ApplySettings(settingsToApply);
+                NotifyStorageChanged(null);
+            });
 
             if (_hotkeyRegistered)
             {
@@ -917,8 +999,9 @@ namespace ClipFlow
             if (item.IsFileList)
             {
                 string[] paths = item.FilePaths;
-                string firstPath = paths.Length == 0 ? string.Empty : paths[0];
-                bool exists = File.Exists(firstPath) || Directory.Exists(firstPath);
+                string existingPath = FirstExistingPath(paths);
+                bool exists = !string.IsNullOrEmpty(existingPath);
+                bool hasInvalidPaths = item.HasInvalidFilePaths;
                 Grid fileCard = new Grid { Height = 62 };
                 fileCard.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(44) });
                 fileCard.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -930,12 +1013,12 @@ namespace ClipFlow
                     Background = Brush("#FFF0F0F0"), HorizontalAlignment = HorizontalAlignment.Left,
                     VerticalAlignment = VerticalAlignment.Center
                 };
-                BitmapSource fileIcon = LoadFileIcon(firstPath);
+                BitmapSource fileIcon = LoadFileIcon(existingPath);
                 iconFrame.Child = fileIcon != null
                     ? (UIElement)new Image { Source = fileIcon, Width = 28, Height = 28, Stretch = Stretch.Uniform }
                     : new TextBlock
                     {
-                        Text = Directory.Exists(firstPath) ? "\uE8B7" : "\uE8A5",
+                        Text = Directory.Exists(existingPath) ? "\uE8B7" : "\uE8A5",
                         FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 22,
                         Foreground = Brush("#FF4F6F8F"), HorizontalAlignment = HorizontalAlignment.Center,
                         VerticalAlignment = VerticalAlignment.Center
@@ -946,12 +1029,12 @@ namespace ClipFlow
                 fileInfo.Children.Add(new TextBlock
                 {
                     Text = item.DisplayPreview, FontSize = 14, Foreground = exists ? Brush("#FF1A1A1A") : Brush("#FF8A8A8A"),
-                    TextTrimming = TextTrimming.CharacterEllipsis, ToolTip = firstPath
+                    TextTrimming = TextTrimming.CharacterEllipsis, ToolTip = string.Join("\n", paths)
                 });
                 fileInfo.Children.Add(new TextBlock
                 {
-                    Text = exists ? item.Detail : "文件已被移动或删除",
-                    FontSize = 11, Foreground = exists ? Brush("#FF6E6E6E") : Brush("#FFB04A4A"),
+                    Text = !hasInvalidPaths ? item.Detail : exists ? "部分文件已移动或删除" : "文件已被移动或删除",
+                    FontSize = 11, Foreground = hasInvalidPaths ? Brush("#FFB04A4A") : Brush("#FF6E6E6E"),
                     Margin = new Thickness(0, 4, 0, 0), TextTrimming = TextTrimming.CharacterEllipsis
                 });
                 Grid.SetColumn(fileInfo, 1);
@@ -967,14 +1050,17 @@ namespace ClipFlow
                     ContextMenu menu = new ContextMenu();
                     MenuItem open = new MenuItem { Header = "打开", IsEnabled = exists };
                     MenuItem reveal = new MenuItem { Header = "打开所在位置", IsEnabled = exists };
+                    MenuItem relocate = new MenuItem { Header = "重新定位失效路径…", IsEnabled = hasInvalidPaths };
                     MenuItem favorite = new MenuItem { Header = item.IsFavorite ? "取消固定" : "固定" };
                     MenuItem delete = new MenuItem { Header = "删除" };
-                    open.Click += delegate { OpenFilePath(firstPath); };
-                    reveal.Click += delegate { RevealFilePath(firstPath); };
+                    open.Click += delegate { OpenFilePath(existingPath); };
+                    reveal.Click += delegate { RevealFilePath(existingPath); };
+                    relocate.Click += delegate { RelocateInvalidPath(item); };
                     favorite.Click += delegate { _store.ToggleFavorite(item); RefreshResults(); };
                     delete.Click += delegate { _store.Remove(item); RefreshResults(); };
                     menu.Items.Add(open);
                     menu.Items.Add(reveal);
+                    menu.Items.Add(relocate);
                     menu.Items.Add(new Separator());
                     menu.Items.Add(favorite);
                     menu.Items.Add(delete);
@@ -1147,6 +1233,61 @@ namespace ClipFlow
                 }
             }
             catch { return null; }
+        }
+
+        private static string FirstExistingPath(IEnumerable<string> paths)
+        {
+            if (paths == null) return string.Empty;
+            foreach (string path in paths)
+            {
+                if (File.Exists(path) || Directory.Exists(path)) return path;
+            }
+            return string.Empty;
+        }
+
+        private void RelocateInvalidPath(ClipboardItem item)
+        {
+            if (item == null) return;
+            string missingPath = null;
+            foreach (string path in item.FilePaths)
+            {
+                if (!File.Exists(path) && !Directory.Exists(path))
+                {
+                    missingPath = path;
+                    break;
+                }
+            }
+            if (string.IsNullOrEmpty(missingPath)) return;
+
+            string replacement = null;
+            bool looksLikeFolder = string.IsNullOrEmpty(Path.GetExtension(missingPath));
+            if (looksLikeFolder)
+            {
+                using (System.Windows.Forms.FolderBrowserDialog dialog = new System.Windows.Forms.FolderBrowserDialog())
+                {
+                    dialog.Description = "为“" + Path.GetFileName(missingPath) + "”选择新的文件夹位置";
+                    dialog.ShowNewFolderButton = false;
+                    if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK) replacement = dialog.SelectedPath;
+                }
+            }
+            else
+            {
+                using (System.Windows.Forms.OpenFileDialog dialog = new System.Windows.Forms.OpenFileDialog())
+                {
+                    dialog.Title = "重新定位 “" + Path.GetFileName(missingPath) + "”";
+                    dialog.FileName = Path.GetFileName(missingPath);
+                    dialog.CheckFileExists = true;
+                    if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK) replacement = dialog.FileName;
+                }
+            }
+            if (string.IsNullOrEmpty(replacement)) return;
+
+            string oldPath = missingPath;
+            _storageQueue.Enqueue(delegate
+            {
+                _store.ReplaceFilePath(item, oldPath, replacement);
+                NotifyStorageChanged("失效路径已更新");
+            });
         }
 
         private static void OpenFilePath(string path)

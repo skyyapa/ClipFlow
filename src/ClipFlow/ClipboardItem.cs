@@ -45,6 +45,16 @@ namespace ClipFlow
             get { return string.IsNullOrEmpty(FilePathsText) ? new string[0] : FilePathsText.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries); }
         }
 
+        public bool HasInvalidFilePaths
+        {
+            get { return IsFileList && Array.Exists(FilePaths, path => !File.Exists(path) && !Directory.Exists(path)); }
+        }
+
+        public bool HasAnyExistingFilePath
+        {
+            get { return IsFileList && Array.Exists(FilePaths, path => File.Exists(path) || Directory.Exists(path)); }
+        }
+
         public BitmapSource Thumbnail
         {
             get
