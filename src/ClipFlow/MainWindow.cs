@@ -36,6 +36,12 @@ namespace ClipFlow
         private readonly System.Windows.Forms.NotifyIcon _tray;
         private readonly Button _invalidFilterButton;
         private readonly Button _clearButton;
+        private readonly PasteQueueSession _pasteQueue;
+        private readonly Border _queueBar;
+        private readonly TextBlock _queueText;
+        private readonly Button _queueStartButton;
+        private readonly Button _queueClearButton;
+        private readonly Dictionary<uint, DateTime> _selfClipboardSequences = new Dictionary<uint, DateTime>();
         private HwndSource _source;
         private IntPtr _handle;
         private IntPtr _returnWindow;
@@ -45,10 +51,8 @@ namespace ClipFlow
         private bool _hotkeyRegistered;
         private bool _showInvalidFiles;
         private bool _updatingSourceFilter;
-        private string _selfWrittenText;
-        private bool _selfWrittenImage;
-        private string _selfWrittenFiles;
-        private DateTime _selfWriteExpires;
+        private int _childDialogDepth;
+        private bool _pasteDispatchInFlight;
         private bool _isWindowDragging;
         private System.Drawing.Point _dragStartCursor;
         private double _dragStartLeft;
@@ -64,6 +68,7 @@ namespace ClipFlow
             _store = new HistoryStore(_settings);
             _storageQueue = new StorageWorkQueue();
             _storageQueue.Failed += StorageQueueFailed;
+            _pasteQueue = new PasteQueueSession();
 
             Title = "ClipFlow";
             Width = 372;
@@ -93,6 +98,7 @@ namespace ClipFlow
             Content = shell;
 
             Grid layout = new Grid();
+            layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -207,7 +213,7 @@ namespace ClipFlow
                 string prompt = _showInvalidFiles
                     ? "清理所有未收藏的失效文件记录？收藏的记录会保留。"
                     : "清空所有未固定的剪贴板历史？";
-                MessageBoxResult choice = MessageBox.Show(prompt, "ClipFlow",
+                MessageBoxResult choice = ShowGuardedMessage(prompt, "ClipFlow",
                     MessageBoxButton.YesNo, MessageBoxImage.Question);
                 if (choice == MessageBoxResult.Yes)
                 {
@@ -274,6 +280,49 @@ namespace ClipFlow
             Grid.SetRow(searchRow, 2);
             layout.Children.Add(searchRow);
 
+            _queueBar = new Border
+            {
+                Background = Brush("#FFEAF3FB"),
+                BorderBrush = Brush("#FFC9DFF2"),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(7),
+                Padding = new Thickness(9, 6, 7, 6),
+                Margin = new Thickness(0, 7, 0, 0),
+                Visibility = Visibility.Collapsed
+            };
+            Grid queueLayout = new Grid();
+            queueLayout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            queueLayout.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            queueLayout.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            _queueText = new TextBlock
+            {
+                Foreground = Brush("#FF315B7D"),
+                FontSize = 11,
+                VerticalAlignment = VerticalAlignment.Center,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                Margin = new Thickness(0, 0, 6, 0)
+            };
+            queueLayout.Children.Add(_queueText);
+            _queueStartButton = new Button
+            {
+                Content = "开始", Height = 27, Padding = new Thickness(9, 2, 9, 2),
+                Margin = new Thickness(0, 0, 5, 0)
+            };
+            _queueStartButton.Click += delegate { StartPasteQueue(); };
+            Grid.SetColumn(_queueStartButton, 1);
+            queueLayout.Children.Add(_queueStartButton);
+            _queueClearButton = new Button { Content = "清空", Height = 27, Padding = new Thickness(8, 2, 8, 2) };
+            _queueClearButton.Click += delegate
+            {
+                _pasteQueue.Clear();
+                UpdateQueueBar();
+            };
+            Grid.SetColumn(_queueClearButton, 2);
+            queueLayout.Children.Add(_queueClearButton);
+            _queueBar.Child = queueLayout;
+            Grid.SetRow(_queueBar, 3);
+            layout.Children.Add(_queueBar);
+
             _resultsList = new ListBox
             {
                 Background = Brushes.Transparent,
@@ -320,7 +369,7 @@ namespace ClipFlow
             _scrollThumb.MouseLeftButtonUp += ScrollThumbMouseLeftButtonUp;
             Grid.SetColumn(_scrollThumb, 1);
             _resultsHost.Children.Add(_scrollThumb);
-            Grid.SetRow(_resultsHost, 3);
+            Grid.SetRow(_resultsHost, 4);
             layout.Children.Add(_resultsHost);
 
             Grid footer = new Grid { Margin = new Thickness(2, 4, 2, 0) };
@@ -342,7 +391,7 @@ namespace ClipFlow
             footer.Children.Add(_statusText);
             Grid.SetColumn(hints, 1);
             footer.Children.Add(hints);
-            Grid.SetRow(footer, 4);
+            Grid.SetRow(footer, 5);
             layout.Children.Add(footer);
 
             _captureTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(70) };
@@ -353,7 +402,7 @@ namespace ClipFlow
             PreviewKeyDown += WindowPreviewKeyDown;
             MouseMove += WindowDragMouseMove;
             MouseLeftButtonUp += WindowDragMouseUp;
-            Deactivated += delegate { if (!_isExiting) Hide(); };
+            Deactivated += delegate { if (!_isExiting && _childDialogDepth == 0) Hide(); };
             Closing += WindowClosing;
             SourceInitialized += delegate { EnableAcrylicBackground(); };
         }
@@ -382,11 +431,12 @@ namespace ClipFlow
         internal void ShowPalette()
         {
             IntPtr foreground = NativeMethods.GetForegroundWindow();
-            if (foreground != _handle) _returnWindow = foreground;
+            if (!_pasteQueue.IsActive && foreground != _handle) _returnWindow = foreground;
 
             _searchBox.Text = string.Empty;
             RefreshSourceFilter();
             RefreshResults();
+            UpdateQueueBar();
             Show();
             PositionNearCursor();
             Activate();
@@ -414,12 +464,24 @@ namespace ClipFlow
         {
             if (message == NativeMethods.WM_HOTKEY && wParam.ToInt32() == HotkeyId)
             {
-                ShowPalette();
+                if (_childDialogDepth > 0)
+                {
+                    handled = true;
+                    return IntPtr.Zero;
+                }
+                if (_pasteQueue.IsActive)
+                {
+                    IntPtr target = NativeMethods.GetForegroundWindow();
+                    if (target == _handle) target = _returnWindow;
+                    BeginQueuePaste(target);
+                }
+                else ShowPalette();
                 handled = true;
             }
             else if (message == NativeMethods.WM_CLIPBOARDUPDATE && !_isPaused)
             {
                 _captureAttempts = 0;
+                _captureTimer.Interval = TimeSpan.FromMilliseconds(70);
                 _captureTimer.Stop();
                 _captureTimer.Start();
             }
@@ -429,6 +491,7 @@ namespace ClipFlow
         private void CaptureTimerTick(object sender, EventArgs eventArgs)
         {
             _captureTimer.Stop();
+            if (ConsumeSelfClipboardSequence()) return;
             try
             {
                 if (Clipboard.ContainsFileDropList())
@@ -436,13 +499,6 @@ namespace ClipFlow
                     StringCollection fileDrop = Clipboard.GetFileDropList();
                     List<string> paths = new List<string>();
                     foreach (string path in fileDrop) paths.Add(path);
-                    string serializedFiles = string.Join("\n", paths.ToArray());
-                    if (!string.IsNullOrEmpty(_selfWrittenFiles) && DateTime.Now <= _selfWriteExpires &&
-                        string.Equals(serializedFiles, _selfWrittenFiles, StringComparison.OrdinalIgnoreCase))
-                    {
-                        _selfWrittenFiles = null;
-                        return;
-                    }
                     string fileSourceApp;
                     string fileSourceTitle;
                     GetForegroundApp(out fileSourceApp, out fileSourceTitle);
@@ -459,12 +515,6 @@ namespace ClipFlow
                 BitmapSource image = TryGetClipboardImage();
                 if (image != null)
                 {
-                    if (_selfWrittenImage && DateTime.Now <= _selfWriteExpires)
-                    {
-                        _selfWrittenImage = false;
-                        return;
-                    }
-
                     string imageSourceApp;
                     string imageSourceTitle;
                     GetForegroundApp(out imageSourceApp, out imageSourceTitle);
@@ -482,13 +532,6 @@ namespace ClipFlow
                 if (!Clipboard.ContainsText(TextDataFormat.UnicodeText)) return;
                 string text = Clipboard.GetText(TextDataFormat.UnicodeText);
                 if (string.IsNullOrEmpty(text)) return;
-
-                if (!string.IsNullOrEmpty(_selfWrittenText) && DateTime.Now <= _selfWriteExpires &&
-                    string.Equals(text, _selfWrittenText, StringComparison.Ordinal))
-                {
-                    _selfWrittenText = null;
-                    return;
-                }
 
                 string rtf = Clipboard.ContainsData(DataFormats.Rtf) ? Clipboard.GetData(DataFormats.Rtf) as string : null;
                 string html = Clipboard.ContainsData(DataFormats.Html) ? Clipboard.GetData(DataFormats.Html) as string : null;
@@ -594,11 +637,57 @@ namespace ClipFlow
 
         private void PasteItem(ClipboardItem item, bool plainTextOnly)
         {
-            if (item == null) return;
+            DispatchPasteEntry(PasteQueueEntry.FromItem(item, plainTextOnly), _returnWindow, false);
+        }
 
+        private void DispatchPasteEntry(PasteQueueEntry entry, IntPtr targetWindow, bool fromQueue)
+        {
+            if (entry == null || _pasteDispatchInFlight) return;
+            if (targetWindow == IntPtr.Zero || !NativeMethods.IsWindow(targetWindow))
+            {
+                if (fromQueue) _pasteQueue.CompleteCurrent(false);
+                ReportPasteFailure("目标窗口不可用，队列已暂停");
+                UpdateQueueBar();
+                return;
+            }
+
+            _pasteDispatchInFlight = true;
+            string error;
+            uint expectedClipboardSequence;
+            if (!PrepareClipboard(entry, out expectedClipboardSequence, out error))
+            {
+                _pasteDispatchInFlight = false;
+                if (fromQueue) _pasteQueue.CompleteCurrent(false);
+                ReportPasteFailure(error);
+                UpdateQueueBar();
+                return;
+            }
+
+            Hide();
+            WaitForModifierRelease(entry, targetWindow, fromQueue, expectedClipboardSequence);
+        }
+
+        private bool PrepareClipboard(PasteQueueEntry entry, out uint clipboardSequence, out string error)
+        {
+            clipboardSequence = 0;
+            error = null;
             try
             {
-                if (item.IsFileList)
+                ClipboardItem item = entry.Item;
+                if (entry.Mode == PasteEntryMode.Table)
+                {
+                    if (string.IsNullOrEmpty(entry.Text))
+                    {
+                        error = "表格内容为空";
+                        return false;
+                    }
+                    DataObject tableData = new DataObject();
+                    tableData.SetData(DataFormats.UnicodeText, entry.Text);
+                    tableData.SetData(DataFormats.Text, entry.Text);
+                    if (!string.IsNullOrEmpty(entry.Html)) tableData.SetData(DataFormats.Html, entry.Html);
+                    Clipboard.SetDataObject(tableData, true);
+                }
+                else if (item != null && item.IsFileList)
                 {
                     StringCollection files = new StringCollection();
                     foreach (string path in item.FilePaths)
@@ -607,59 +696,246 @@ namespace ClipFlow
                     }
                     if (files.Count == 0)
                     {
-                        _statusText.Text = "文件已被移动或删除";
-                        return;
+                        error = "文件已被移动或删除";
+                        return false;
                     }
-                    _selfWrittenFiles = string.Join("\n", item.FilePaths);
-                    _selfWriteExpires = DateTime.Now.AddSeconds(2);
                     Clipboard.SetFileDropList(files);
-                    _store.MarkUsed(item);
                 }
-                else if (item.IsImage)
+                else if (item != null && item.IsImage)
                 {
                     BitmapSource bitmap = LoadBitmap(item.ImagePath);
                     if (bitmap == null)
                     {
-                        _statusText.Text = "图片文件已丢失";
-                        return;
+                        error = "图片文件已丢失";
+                        return false;
                     }
-                    _selfWrittenImage = true;
-                    _selfWriteExpires = DateTime.Now.AddSeconds(2);
                     Clipboard.SetImage(bitmap);
-                    _store.MarkUsed(item);
                 }
                 else
                 {
-                    if (string.IsNullOrEmpty(item.Text)) return;
-                DataObject data = new DataObject();
-                data.SetData(DataFormats.UnicodeText, item.Text);
-                data.SetData(DataFormats.Text, item.Text);
-                if (!plainTextOnly)
-                {
-                    if (!string.IsNullOrEmpty(item.Rtf)) data.SetData(DataFormats.Rtf, item.Rtf);
-                    if (!string.IsNullOrEmpty(item.Html)) data.SetData(DataFormats.Html, item.Html);
+                    if (item == null || string.IsNullOrEmpty(item.Text))
+                    {
+                        error = "文字内容为空";
+                        return false;
+                    }
+                    DataObject data = new DataObject();
+                    data.SetData(DataFormats.UnicodeText, item.Text);
+                    data.SetData(DataFormats.Text, item.Text);
+                    if (entry.Mode == PasteEntryMode.Original)
+                    {
+                        if (!string.IsNullOrEmpty(item.Rtf)) data.SetData(DataFormats.Rtf, item.Rtf);
+                        if (!string.IsNullOrEmpty(item.Html)) data.SetData(DataFormats.Html, item.Html);
+                    }
+                    Clipboard.SetDataObject(data, true);
                 }
-                _selfWrittenText = item.Text;
-                _selfWriteExpires = DateTime.Now.AddSeconds(2);
-                Clipboard.SetDataObject(data, true);
-                _store.MarkUsed(item);
-                }
+                clipboardSequence = RememberSelfClipboardSequence();
+                return true;
             }
             catch (ExternalException)
             {
-                _statusText.Text = "剪贴板正被其他应用占用，请重试";
+                error = "剪贴板正被其他应用占用，请重试";
+                return false;
+            }
+        }
+
+        private void WaitForModifierRelease(PasteQueueEntry entry, IntPtr targetWindow, bool fromQueue, uint expectedClipboardSequence)
+        {
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(900);
+            DispatcherTimer releaseTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(30) };
+            releaseTimer.Tick += delegate
+            {
+                bool modifiersDown = IsModifierDown(NativeMethods.VK_CONTROL) ||
+                    IsModifierDown(NativeMethods.VK_SHIFT) || IsModifierDown(NativeMethods.VK_MENU);
+                if (modifiersDown && DateTime.UtcNow < deadline) return;
+                releaseTimer.Stop();
+                if (modifiersDown)
+                {
+                    FinishPasteDispatch(entry, fromQueue, false, "请松开快捷键后重试，队列没有前进");
+                    return;
+                }
+                if (!NativeMethods.IsWindow(targetWindow) ||
+                    (!NativeMethods.SetForegroundWindow(targetWindow) && NativeMethods.GetForegroundWindow() != targetWindow))
+                {
+                    FinishPasteDispatch(entry, fromQueue, false, "无法切换到目标窗口，队列没有前进");
+                    return;
+                }
+
+                DispatcherTimer sendTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(90) };
+                sendTimer.Tick += delegate
+                {
+                    sendTimer.Stop();
+                    if (!NativeMethods.IsWindow(targetWindow) || NativeMethods.GetForegroundWindow() != targetWindow)
+                    {
+                        FinishPasteDispatch(entry, fromQueue, false, "目标窗口已改变，队列没有前进");
+                        return;
+                    }
+                    if (expectedClipboardSequence == 0 ||
+                        NativeMethods.GetClipboardSequenceNumber() != expectedClipboardSequence)
+                    {
+                        FinishPasteDispatch(entry, fromQueue, false, "剪贴板内容已被其他操作改变，队列没有前进");
+                        return;
+                    }
+                    NativeMethods.SendPaste();
+                    FinishPasteDispatch(entry, fromQueue, true, null);
+                };
+                sendTimer.Start();
+            };
+            releaseTimer.Start();
+        }
+
+        private void FinishPasteDispatch(PasteQueueEntry entry, bool fromQueue, bool success, string error)
+        {
+            _pasteDispatchInFlight = false;
+            if (fromQueue) _pasteQueue.CompleteCurrent(success);
+            if (success && entry != null && entry.Item != null)
+            {
+                ClipboardItem used = entry.Item;
+                _storageQueue.Enqueue(delegate { _store.MarkUsed(used); });
+            }
+            if (!success) ReportPasteFailure(error);
+            else if (fromQueue && _pasteQueue.Count == 0)
+                _tray.ShowBalloonTip(1600, "ClipFlow", "连续粘贴队列已完成", System.Windows.Forms.ToolTipIcon.Info);
+            UpdateQueueBar();
+        }
+
+        private static bool IsModifierDown(int virtualKey)
+        {
+            return (NativeMethods.GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+        }
+
+        private void ReportPasteFailure(string message)
+        {
+            string value = string.IsNullOrEmpty(message) ? "粘贴失败，请重试" : message;
+            _statusText.Text = value;
+            if (!IsVisible) _tray.ShowBalloonTip(2200, "ClipFlow", value, System.Windows.Forms.ToolTipIcon.Warning);
+        }
+
+        private void AddToPasteQueue(PasteQueueEntry entry)
+        {
+            if (entry == null) return;
+            _pasteQueue.Add(entry);
+            UpdateQueueBar();
+            _statusText.Text = "已加入连续粘贴队列，共 " + _pasteQueue.Count + " 条";
+        }
+
+        private void StartPasteQueue()
+        {
+            if (_pasteQueue.Count == 0) return;
+            bool starting = !_pasteQueue.IsActive;
+            if (starting && !_pasteQueue.Start()) return;
+            IntPtr target = _returnWindow;
+            if (target == IntPtr.Zero || !NativeMethods.IsWindow(target))
+            {
+                IntPtr foreground = NativeMethods.GetForegroundWindow();
+                if (foreground != _handle) target = foreground;
+            }
+            UpdateQueueBar();
+            if (starting && _pasteQueue.Count > 1)
+            {
+                _tray.ShowBalloonTip(2400, "ClipFlow 连续粘贴",
+                    "第一条将立即粘贴；之后每按一次 " + GetHotkeyDisplay() + " 粘贴下一条。",
+                    System.Windows.Forms.ToolTipIcon.Info);
+            }
+            BeginQueuePaste(target);
+        }
+
+        private void BeginQueuePaste(IntPtr targetWindow)
+        {
+            if (_pasteDispatchInFlight) return;
+            PasteQueueEntry entry;
+            if (!_pasteQueue.TryBeginNext(out entry)) return;
+            DispatchPasteEntry(entry, targetWindow, true);
+        }
+
+        private void UpdateQueueBar()
+        {
+            if (_queueBar == null) return;
+            _queueBar.Visibility = _pasteQueue.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+            if (_pasteQueue.Count > 0)
+            {
+                PasteQueueEntry next = _pasteQueue.Next;
+                _queueText.Text = (_pasteQueue.IsActive ? "连续粘贴" : "队列") + " · " + _pasteQueue.Count +
+                    " 条 · 下一条：" + (next == null ? string.Empty : next.Preview);
+            }
+            _queueStartButton.Content = _pasteQueue.IsActive ? "下一条" : "开始";
+            _queueStartButton.IsEnabled = _pasteQueue.Count > 0 && !_pasteDispatchInFlight;
+            _queueClearButton.IsEnabled = !_pasteDispatchInFlight;
+            _tray.Text = _pasteQueue.Count > 0
+                ? "ClipFlow · 连续粘贴剩余 " + _pasteQueue.Count + " 条"
+                : "ClipFlow 剪贴板管理器";
+        }
+
+        private void ShowTablePreview(ClipboardItem item)
+        {
+            if (item == null || item.IsImage || item.IsFileList || string.IsNullOrEmpty(item.Text) || !HasMultipleLines(item.Text))
+            {
+                _statusText.Text = "只有多行文字可以转换为表格";
                 return;
             }
 
-            Hide();
-            DispatcherTimer pasteTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(90) };
-            pasteTimer.Tick += delegate
+            _childDialogDepth++;
+            try
             {
-                pasteTimer.Stop();
-                if (_returnWindow != IntPtr.Zero) NativeMethods.SetForegroundWindow(_returnWindow);
-                NativeMethods.SendPaste();
-            };
-            pasteTimer.Start();
+                TablePreviewWindow preview = new TablePreviewWindow(item.Text)
+                {
+                    Owner = this,
+                    Topmost = true
+                };
+                if (preview.ShowDialog() != true || preview.Result == null) return;
+                PasteQueueEntry entry = PasteQueueEntry.FromTable(item, preview.Result);
+                if (preview.Action == TablePreviewAction.AddToQueue) AddToPasteQueue(entry);
+                else if (preview.Action == TablePreviewAction.Paste) DispatchPasteEntry(entry, _returnWindow, false);
+            }
+            finally
+            {
+                _childDialogDepth--;
+            }
+        }
+
+        private MessageBoxResult ShowGuardedMessage(string message, string caption,
+            MessageBoxButton buttons, MessageBoxImage image)
+        {
+            _childDialogDepth++;
+            try
+            {
+                return MessageBox.Show(this, message, caption, buttons, image);
+            }
+            finally
+            {
+                _childDialogDepth--;
+            }
+        }
+
+        private static bool HasMultipleLines(string text)
+        {
+            return !string.IsNullOrEmpty(text) && text.IndexOfAny(new[] { '\r', '\n', '\u2028', '\u2029' }) >= 0;
+        }
+
+        private uint RememberSelfClipboardSequence()
+        {
+            PruneClipboardSequences();
+            uint sequence = NativeMethods.GetClipboardSequenceNumber();
+            if (sequence != 0) _selfClipboardSequences[sequence] = DateTime.UtcNow.AddSeconds(5);
+            return sequence;
+        }
+
+        private bool ConsumeSelfClipboardSequence()
+        {
+            PruneClipboardSequences();
+            uint sequence = NativeMethods.GetClipboardSequenceNumber();
+            if (sequence == 0 || !_selfClipboardSequences.ContainsKey(sequence)) return false;
+            return true;
+        }
+
+        private void PruneClipboardSequences()
+        {
+            DateTime now = DateTime.UtcNow;
+            List<uint> expired = new List<uint>();
+            foreach (KeyValuePair<uint, DateTime> pair in _selfClipboardSequences)
+            {
+                if (pair.Value < now) expired.Add(pair.Key);
+            }
+            foreach (uint sequence in expired) _selfClipboardSequences.Remove(sequence);
         }
 
         private static BitmapSource TryGetClipboardImage()
@@ -787,7 +1063,9 @@ namespace ClipFlow
 
             if (eventArgs.Key == Key.Enter)
             {
-                PasteSelected((Keyboard.Modifiers & ModifierKeys.Shift) == ModifierKeys.Shift);
+                if ((Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control)
+                    ShowTablePreview(GetSelectedItem());
+                else PasteSelected((Keyboard.Modifiers & ModifierKeys.Shift) == ModifierKeys.Shift);
                 eventArgs.Handled = true;
                 return;
             }
@@ -955,6 +1233,7 @@ namespace ClipFlow
             System.Windows.Forms.ToolStripMenuItem open = new System.Windows.Forms.ToolStripMenuItem("打开 ClipFlow");
             System.Windows.Forms.ToolStripMenuItem pause = new System.Windows.Forms.ToolStripMenuItem("暂停记录");
             System.Windows.Forms.ToolStripMenuItem settings = new System.Windows.Forms.ToolStripMenuItem("设置…");
+            System.Windows.Forms.ToolStripMenuItem cancelQueue = new System.Windows.Forms.ToolStripMenuItem("取消连续粘贴队列");
             System.Windows.Forms.ToolStripMenuItem clear = new System.Windows.Forms.ToolStripMenuItem("清空未收藏历史");
             System.Windows.Forms.ToolStripMenuItem exit = new System.Windows.Forms.ToolStripMenuItem("退出");
             open.Click += delegate { Dispatcher.BeginInvoke(new Action(ShowPalette)); };
@@ -965,11 +1244,24 @@ namespace ClipFlow
                 Dispatcher.BeginInvoke(new Action(RefreshResults));
             };
             settings.Click += delegate { Dispatcher.BeginInvoke(new Action(ShowSettings)); };
+            cancelQueue.Click += delegate
+            {
+                Dispatcher.BeginInvoke(new Action(delegate
+                {
+                    if (_pasteDispatchInFlight)
+                    {
+                        _tray.ShowBalloonTip(1600, "ClipFlow", "当前一条正在粘贴，请稍后再取消", System.Windows.Forms.ToolTipIcon.Info);
+                        return;
+                    }
+                    _pasteQueue.Clear();
+                    UpdateQueueBar();
+                }));
+            };
             clear.Click += delegate
             {
                 Dispatcher.BeginInvoke(new Action(delegate
                 {
-                    MessageBoxResult choice = MessageBox.Show("清空所有未收藏的剪贴板历史？", "ClipFlow",
+                    MessageBoxResult choice = ShowGuardedMessage("清空所有未收藏的剪贴板历史？", "ClipFlow",
                         MessageBoxButton.YesNo, MessageBoxImage.Question);
                     if (choice == MessageBoxResult.Yes)
                     {
@@ -982,6 +1274,7 @@ namespace ClipFlow
             menu.Items.Add(open);
             menu.Items.Add(pause);
             menu.Items.Add(settings);
+            menu.Items.Add(cancelQueue);
             menu.Items.Add(clear);
             menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
             menu.Items.Add(exit);
@@ -992,33 +1285,41 @@ namespace ClipFlow
 
         internal void ShowSettings()
         {
-            SettingsWindow window = new SettingsWindow(_settings) { Topmost = true };
-            if (window.ShowDialog() != true || window.Result == null) return;
-            AppSettings previous = _settings;
-            _settings = window.Result;
-            _settingsStore.Save(_settings);
-            AppSettings settingsToApply = _settings;
-            _storageQueue.Enqueue(delegate
+            SettingsWindow window = new SettingsWindow(_settings) { Owner = this, Topmost = true };
+            _childDialogDepth++;
+            try
             {
-                _store.ApplySettings(settingsToApply);
-                NotifyStorageChanged(null);
-            });
-
-            if (_hotkeyRegistered)
-            {
-                NativeMethods.UnregisterHotKey(_handle, HotkeyId);
-                _hotkeyRegistered = false;
-            }
-            if (!RegisterConfiguredHotkey())
-            {
-                _settings.HotkeyModifiers = previous.HotkeyModifiers;
-                _settings.HotkeyKey = previous.HotkeyKey;
+                if (window.ShowDialog() != true || window.Result == null) return;
+                AppSettings previous = _settings;
+                _settings = window.Result;
                 _settingsStore.Save(_settings);
-                RegisterConfiguredHotkey();
-                MessageBox.Show("新快捷键已被其他程序占用，已恢复为 " + GetHotkeyDisplay() + "。",
-                    "ClipFlow", MessageBoxButton.OK, MessageBoxImage.Warning);
+                AppSettings settingsToApply = _settings;
+                _storageQueue.Enqueue(delegate
+                {
+                    _store.ApplySettings(settingsToApply);
+                    NotifyStorageChanged(null);
+                });
+
+                if (_hotkeyRegistered)
+                {
+                    NativeMethods.UnregisterHotKey(_handle, HotkeyId);
+                    _hotkeyRegistered = false;
+                }
+                if (!RegisterConfiguredHotkey())
+                {
+                    _settings.HotkeyModifiers = previous.HotkeyModifiers;
+                    _settings.HotkeyKey = previous.HotkeyKey;
+                    _settingsStore.Save(_settings);
+                    RegisterConfiguredHotkey();
+                    MessageBox.Show(this, "新快捷键已被其他程序占用，已恢复为 " + GetHotkeyDisplay() + "。",
+                        "ClipFlow", MessageBoxButton.OK, MessageBoxImage.Warning);
+                }
+                RefreshResults();
             }
-            RefreshResults();
+            finally
+            {
+                _childDialogDepth--;
+            }
         }
 
         private bool RegisterConfiguredHotkey()
@@ -1113,16 +1414,19 @@ namespace ClipFlow
                     MenuItem open = new MenuItem { Header = "打开", IsEnabled = exists };
                     MenuItem reveal = new MenuItem { Header = "打开所在位置", IsEnabled = exists };
                     MenuItem relocate = new MenuItem { Header = "重新定位失效路径…", IsEnabled = hasInvalidPaths };
+                    MenuItem enqueue = new MenuItem { Header = "加入连续粘贴队列" };
                     MenuItem favorite = new MenuItem { Header = item.IsFavorite ? "取消固定" : "固定" };
                     MenuItem delete = new MenuItem { Header = "删除" };
                     open.Click += delegate { OpenFilePath(existingPath); };
                     reveal.Click += delegate { RevealFilePath(existingPath); };
                     relocate.Click += delegate { RelocateInvalidPath(item); };
+                    enqueue.Click += delegate { AddToPasteQueue(PasteQueueEntry.FromItem(item, false)); };
                     favorite.Click += delegate { _store.ToggleFavorite(item); RefreshResults(); };
                     delete.Click += delegate { _store.Remove(item); RefreshResults(); };
                     menu.Items.Add(open);
                     menu.Items.Add(reveal);
                     menu.Items.Add(relocate);
+                    menu.Items.Add(enqueue);
                     menu.Items.Add(new Separator());
                     menu.Items.Add(favorite);
                     menu.Items.Add(delete);
@@ -1194,10 +1498,14 @@ namespace ClipFlow
                 moreButton.Click += delegate
                 {
                     ContextMenu menu = new ContextMenu();
+                    MenuItem enqueue = new MenuItem { Header = "加入连续粘贴队列" };
                     MenuItem favorite = new MenuItem { Header = item.IsFavorite ? "取消固定" : "固定" };
                     MenuItem delete = new MenuItem { Header = "删除" };
+                    enqueue.Click += delegate { AddToPasteQueue(PasteQueueEntry.FromItem(item, false)); };
                     favorite.Click += delegate { _store.ToggleFavorite(item); RefreshResults(); };
                     delete.Click += delegate { _store.Remove(item); RefreshResults(); };
+                    menu.Items.Add(enqueue);
+                    menu.Items.Add(new Separator());
                     menu.Items.Add(favorite);
                     menu.Items.Add(delete);
                     moreButton.ContextMenu = menu;
@@ -1223,7 +1531,7 @@ namespace ClipFlow
 
             Grid textCard = new Grid();
             textCard.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            textCard.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(66) });
+            textCard.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(112) });
             StackPanel stack = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
             stack.Children.Add(new TextBlock
             {
@@ -1259,6 +1567,31 @@ namespace ClipFlow
                 PasteItem(item, true);
                 eventArgs.Handled = true;
             };
+            Button tablePaste = CreateCardIconButton("T", "表格预览");
+            tablePaste.Content = new TextBlock
+            {
+                Text = "▦", FontFamily = new FontFamily("Segoe UI Symbol"), FontSize = 15,
+                Foreground = Brush("#FF3F5F7F")
+            };
+            tablePaste.ToolTip = "多行文字转表格";
+            tablePaste.Visibility = HasMultipleLines(item.Text) ? Visibility.Visible : Visibility.Collapsed;
+            tablePaste.Click += delegate(object sender, RoutedEventArgs eventArgs)
+            {
+                ShowTablePreview(item);
+                eventArgs.Handled = true;
+            };
+            Button enqueueText = CreateCardIconButton("+", "加入连续粘贴队列");
+            enqueueText.Content = new TextBlock
+            {
+                Text = "+", FontFamily = new FontFamily("Segoe UI"), FontSize = 18,
+                Foreground = Brush("#FF3F5F7F"), Margin = new Thickness(0, -2, 0, 0)
+            };
+            enqueueText.ToolTip = "加入连续粘贴队列";
+            enqueueText.Click += delegate(object sender, RoutedEventArgs eventArgs)
+            {
+                AddToPasteQueue(PasteQueueEntry.FromItem(item, false));
+                eventArgs.Handled = true;
+            };
             Button textPin = CreateCardIconButton(item.IsFavorite ? "\uE77A" : "\uE718",
                 item.IsFavorite ? "取消收藏" : "收藏");
             textPin.Click += delegate(object sender, RoutedEventArgs eventArgs)
@@ -1268,6 +1601,8 @@ namespace ClipFlow
                 eventArgs.Handled = true;
             };
             textActions.Children.Add(plainPaste);
+            textActions.Children.Add(tablePaste);
+            textActions.Children.Add(enqueueText);
             textActions.Children.Add(textPin);
             Grid.SetColumn(textActions, 1);
             textCard.Children.Add(textActions);
@@ -1323,24 +1658,32 @@ namespace ClipFlow
 
             string replacement = null;
             bool looksLikeFolder = string.IsNullOrEmpty(Path.GetExtension(missingPath));
-            if (looksLikeFolder)
+            _childDialogDepth++;
+            try
             {
-                using (System.Windows.Forms.FolderBrowserDialog dialog = new System.Windows.Forms.FolderBrowserDialog())
+                if (looksLikeFolder)
                 {
-                    dialog.Description = "为“" + Path.GetFileName(missingPath) + "”选择新的文件夹位置";
-                    dialog.ShowNewFolderButton = false;
-                    if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK) replacement = dialog.SelectedPath;
+                    using (System.Windows.Forms.FolderBrowserDialog dialog = new System.Windows.Forms.FolderBrowserDialog())
+                    {
+                        dialog.Description = "为“" + Path.GetFileName(missingPath) + "”选择新的文件夹位置";
+                        dialog.ShowNewFolderButton = false;
+                        if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK) replacement = dialog.SelectedPath;
+                    }
+                }
+                else
+                {
+                    using (System.Windows.Forms.OpenFileDialog dialog = new System.Windows.Forms.OpenFileDialog())
+                    {
+                        dialog.Title = "重新定位 “" + Path.GetFileName(missingPath) + "”";
+                        dialog.FileName = Path.GetFileName(missingPath);
+                        dialog.CheckFileExists = true;
+                        if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK) replacement = dialog.FileName;
+                    }
                 }
             }
-            else
+            finally
             {
-                using (System.Windows.Forms.OpenFileDialog dialog = new System.Windows.Forms.OpenFileDialog())
-                {
-                    dialog.Title = "重新定位 “" + Path.GetFileName(missingPath) + "”";
-                    dialog.FileName = Path.GetFileName(missingPath);
-                    dialog.CheckFileExists = true;
-                    if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK) replacement = dialog.FileName;
-                }
+                _childDialogDepth--;
             }
             if (string.IsNullOrEmpty(replacement)) return;
 

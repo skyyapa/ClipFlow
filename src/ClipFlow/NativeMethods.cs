@@ -13,6 +13,8 @@ namespace ClipFlow
         internal const uint MOD_SHIFT = 0x0004;
         internal const uint KEYEVENTF_KEYUP = 0x0002;
         internal const byte VK_CONTROL = 0x11;
+        internal const int VK_SHIFT = 0x10;
+        internal const int VK_MENU = 0x12;
         internal const byte VK_V = 0x56;
         internal const int WM_NCLBUTTONDOWN = 0x00A1;
         internal const int HTCAPTION = 2;
@@ -85,6 +87,16 @@ namespace ClipFlow
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool SetForegroundWindow(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool IsWindow(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        internal static extern short GetAsyncKeyState(int virtualKey);
+
+        [DllImport("user32.dll")]
+        internal static extern uint GetClipboardSequenceNumber();
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         internal static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int count);

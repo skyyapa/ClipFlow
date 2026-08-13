@@ -283,8 +283,8 @@ namespace ClipFlow
             {
                 item.LastUsedAt = DateTime.Now;
                 item.UseCount++;
-                _database.Execute("UPDATE items SET last_used_at=?,use_count=? WHERE id=?;",
-                    ToStorageTime(item.LastUsedAt), item.UseCount, item.Id);
+                _database.Execute("UPDATE items SET last_used_at=?,use_count=use_count+1 WHERE id=?;",
+                    ToStorageTime(item.LastUsedAt), item.Id);
             }
         }
 
