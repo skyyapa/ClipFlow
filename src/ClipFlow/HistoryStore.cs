@@ -172,13 +172,21 @@ namespace ClipFlow
 
         internal List<ClipboardItem> Search(string query, int limit)
         {
+            return Search(query, null, limit);
+        }
+
+        internal List<ClipboardItem> Search(string query, string sourceApp, int limit)
+        {
             lock (_gate)
             {
                 int safeLimit = Math.Max(1, Math.Min(limit, 500));
                 if (string.IsNullOrWhiteSpace(query))
                 {
-                    return _database.Query("SELECT " + Columns + " FROM items " +
-                        "ORDER BY is_favorite DESC, created_at DESC LIMIT ?;", ReadItem, safeLimit);
+                    return string.IsNullOrWhiteSpace(sourceApp)
+                        ? _database.Query("SELECT " + Columns + " FROM items " +
+                            "ORDER BY is_favorite DESC, created_at DESC LIMIT ?;", ReadItem, safeLimit)
+                        : _database.Query("SELECT " + Columns + " FROM items WHERE source_app=? COLLATE NOCASE " +
+                            "ORDER BY is_favorite DESC, created_at DESC LIMIT ?;", ReadItem, sourceApp, safeLimit);
                 }
 
                 string[] words = query.Trim().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
@@ -203,6 +211,11 @@ namespace ClipFlow
                     where = "(rowid IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?) OR (" + where + "))";
                     parameters.Insert(0, BuildFtsQuery(words));
                 }
+                if (!string.IsNullOrWhiteSpace(sourceApp))
+                {
+                    where = "source_app=? COLLATE NOCASE AND (" + where + ")";
+                    parameters.Insert(0, sourceApp);
+                }
                 parameters.Add(safeLimit);
                 return _database.Query("SELECT " + Columns + " FROM items WHERE " + where +
                     " ORDER BY is_favorite DESC, created_at DESC LIMIT ?;", ReadItem, parameters.ToArray());
@@ -211,11 +224,28 @@ namespace ClipFlow
 
         internal List<ClipboardItem> SearchInvalidFiles(int limit)
         {
+            return SearchInvalidFiles(null, limit);
+        }
+
+        internal List<ClipboardItem> SearchInvalidFiles(string sourceApp, int limit)
+        {
             lock (_gate)
             {
                 List<ClipboardItem> files = _database.Query("SELECT " + Columns +
                     " FROM items WHERE content_type='Files' ORDER BY is_favorite DESC,created_at DESC;", ReadItem);
-                return files.Where(item => item.HasInvalidFilePaths).Take(Math.Max(1, limit)).ToList();
+                return files.Where(item => item.HasInvalidFilePaths &&
+                    (string.IsNullOrWhiteSpace(sourceApp) || string.Equals(item.SourceApp, sourceApp, StringComparison.OrdinalIgnoreCase)))
+                    .Take(Math.Max(1, limit)).ToList();
+            }
+        }
+
+        internal List<string> GetSourceApplications(int limit)
+        {
+            lock (_gate)
+            {
+                return _database.Query("SELECT source_app FROM items WHERE source_app IS NOT NULL AND trim(source_app)<>'' " +
+                    "GROUP BY source_app COLLATE NOCASE ORDER BY MAX(created_at) DESC LIMIT ?;",
+                    statement => SqliteDatabase.ColumnText(statement, 0), Math.Max(1, Math.Min(limit, 100)));
             }
         }
 

@@ -13,6 +13,8 @@ namespace ClipFlow
         private readonly ComboBox _maximumItems;
         private readonly TextBox _retentionDays;
         private readonly TextBox _maximumMegabytes;
+        private readonly CheckBox _ignoreSensitiveText;
+        private readonly TextBox _excludedApplications;
 
         internal AppSettings Result { get; private set; }
 
@@ -20,7 +22,7 @@ namespace ClipFlow
         {
             Title = "ClipFlow 设置";
             Width = 460;
-            Height = 500;
+            Height = 460;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             ResizeMode = ResizeMode.NoResize;
             Background = new SolidColorBrush(Color.FromRgb(247, 247, 247));
@@ -40,9 +42,15 @@ namespace ClipFlow
             };
             root.Children.Add(heading);
 
-            StackPanel form = new StackPanel();
-            Grid.SetRow(form, 1);
-            root.Children.Add(form);
+            StackPanel form = new StackPanel { Margin = new Thickness(0, 0, 8, 0) };
+            ScrollViewer formScroll = new ScrollViewer
+            {
+                Content = form,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+            };
+            Grid.SetRow(formScroll, 1);
+            root.Children.Add(formScroll);
 
             _startup = new CheckBox { Content = "开机自动启动 ClipFlow", IsChecked = settings.StartWithWindows, Margin = new Thickness(0, 0, 0, 18) };
             form.Children.Add(_startup);
@@ -72,6 +80,30 @@ namespace ClipFlow
             _maximumMegabytes = CreateNumberBox(settings.ImageMaximumMegabytes);
             Grid.SetColumn(_maximumMegabytes, 1); sizeRow.Children.Add(_maximumMegabytes); form.Children.Add(sizeRow);
 
+            _ignoreSensitiveText = new CheckBox
+            {
+                Content = "不记录疑似验证码、银行卡号和密码的单行文本",
+                IsChecked = settings.IgnoreSensitiveText,
+                Margin = new Thickness(0, 3, 0, 14)
+            };
+            form.Children.Add(_ignoreSensitiveText);
+
+            Grid excludedRow = CreateRow("不记录这些应用");
+            _excludedApplications = new TextBox
+            {
+                Width = 240, Height = 48, Text = settings.ExcludedApplications ?? string.Empty,
+                AcceptsReturn = true, TextWrapping = TextWrapping.Wrap,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                Padding = new Thickness(7, 4, 7, 4),
+                ToolTip = "填写进程名，用逗号或换行分隔，例如 KeePass, 1Password"
+            };
+            Grid.SetColumn(_excludedApplications, 1); excludedRow.Children.Add(_excludedApplications); form.Children.Add(excludedRow);
+            form.Children.Add(new TextBlock
+            {
+                Text = "应用名可从剪贴板条目下方看到；不需要填写 .exe。",
+                FontSize = 11, Foreground = Brushes.Gray, Margin = new Thickness(152, -7, 0, 10)
+            });
+
             StackPanel buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
             Button cancel = new Button { Content = "取消", Width = 76, Height = 32, Margin = new Thickness(0, 0, 8, 0) };
             Button save = new Button { Content = "保存", Width = 76, Height = 32, IsDefault = true };
@@ -94,7 +126,9 @@ namespace ClipFlow
                 StartWithWindows = _startup.IsChecked == true,
                 HotkeyModifiers = Convert.ToString(_modifiers.SelectedItem), HotkeyKey = _key.Text,
                 MaximumItems = Convert.ToInt32(_maximumItems.SelectedItem),
-                ImageRetentionDays = days, ImageMaximumMegabytes = megabytes
+                ImageRetentionDays = days, ImageMaximumMegabytes = megabytes,
+                IgnoreSensitiveText = _ignoreSensitiveText.IsChecked == true,
+                ExcludedApplications = _excludedApplications.Text
             };
             Result.Normalize();
             DialogResult = true;

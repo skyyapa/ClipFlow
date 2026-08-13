@@ -14,6 +14,8 @@ namespace ClipFlow
         [DataMember] public int MaximumItems { get; set; }
         [DataMember] public int ImageRetentionDays { get; set; }
         [DataMember] public int ImageMaximumMegabytes { get; set; }
+        [DataMember] public bool IgnoreSensitiveText { get; set; }
+        [DataMember] public string ExcludedApplications { get; set; }
 
         internal static AppSettings Defaults()
         {
@@ -24,7 +26,9 @@ namespace ClipFlow
                 HotkeyKey = "V",
                 MaximumItems = 5000,
                 ImageRetentionDays = 0,
-                ImageMaximumMegabytes = 500
+                ImageMaximumMegabytes = 500,
+                IgnoreSensitiveText = false,
+                ExcludedApplications = string.Empty
             };
         }
 
@@ -37,6 +41,7 @@ namespace ClipFlow
             MaximumItems = Math.Max(50, Math.Min(50000, MaximumItems));
             ImageRetentionDays = Math.Max(0, Math.Min(3650, ImageRetentionDays));
             ImageMaximumMegabytes = Math.Max(10, Math.Min(10240, ImageMaximumMegabytes));
+            ExcludedApplications = ExcludedApplications == null ? string.Empty : ExcludedApplications.Trim();
         }
     }
 

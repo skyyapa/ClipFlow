@@ -26,6 +26,7 @@ namespace ClipFlow
         private readonly HistoryStore _store;
         private readonly StorageWorkQueue _storageQueue;
         private readonly TextBox _searchBox;
+        private readonly ComboBox _sourceFilter;
         private readonly ListBox _resultsList;
         private readonly TextBlock _statusText;
         private readonly TextBlock _modeText;
@@ -43,6 +44,7 @@ namespace ClipFlow
         private bool _isExiting;
         private bool _hotkeyRegistered;
         private bool _showInvalidFiles;
+        private bool _updatingSourceFilter;
         private string _selfWrittenText;
         private bool _selfWrittenImage;
         private string _selfWrittenFiles;
@@ -233,6 +235,10 @@ namespace ClipFlow
             Grid.SetRow(header, 1);
             layout.Children.Add(header);
 
+            Grid searchRow = new Grid();
+            searchRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            searchRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(106) });
+
             _searchBox = new TextBox
             {
                 FontSize = 15,
@@ -247,8 +253,26 @@ namespace ClipFlow
                 Style = CreateRoundedSearchBoxStyle()
             };
             _searchBox.TextChanged += delegate { RefreshResults(); };
-            Grid.SetRow(_searchBox, 2);
-            layout.Children.Add(_searchBox);
+            searchRow.Children.Add(_searchBox);
+
+            _sourceFilter = new ComboBox
+            {
+                Height = 38,
+                Margin = new Thickness(7, 0, 0, 0),
+                Padding = new Thickness(7, 0, 4, 0),
+                VerticalContentAlignment = VerticalAlignment.Center,
+                ToolTip = "按复制来源筛选"
+            };
+            _sourceFilter.Items.Add("全部应用");
+            _sourceFilter.SelectedIndex = 0;
+            _sourceFilter.SelectionChanged += delegate
+            {
+                if (!_updatingSourceFilter) RefreshResults();
+            };
+            Grid.SetColumn(_sourceFilter, 1);
+            searchRow.Children.Add(_sourceFilter);
+            Grid.SetRow(searchRow, 2);
+            layout.Children.Add(searchRow);
 
             _resultsList = new ListBox
             {
@@ -352,6 +376,7 @@ namespace ClipFlow
                     System.Windows.Forms.ToolTipIcon.Warning);
             }
             RefreshResults();
+            RefreshSourceFilter();
         }
 
         internal void ShowPalette()
@@ -360,6 +385,7 @@ namespace ClipFlow
             if (foreground != _handle) _returnWindow = foreground;
 
             _searchBox.Text = string.Empty;
+            RefreshSourceFilter();
             RefreshResults();
             Show();
             PositionNearCursor();
@@ -420,6 +446,7 @@ namespace ClipFlow
                     string fileSourceApp;
                     string fileSourceTitle;
                     GetForegroundApp(out fileSourceApp, out fileSourceTitle);
+                    if (ClipboardCapturePolicy.ShouldIgnoreSource(_settings, fileSourceApp)) return;
                     string[] capturedPaths = paths.ToArray();
                     _storageQueue.Enqueue(delegate
                     {
@@ -441,6 +468,7 @@ namespace ClipFlow
                     string imageSourceApp;
                     string imageSourceTitle;
                     GetForegroundApp(out imageSourceApp, out imageSourceTitle);
+                    if (ClipboardCapturePolicy.ShouldIgnoreSource(_settings, imageSourceApp)) return;
                     BitmapSource capturedImage = image.IsFrozen ? image : image.Clone();
                     if (!capturedImage.IsFrozen) capturedImage.Freeze();
                     _storageQueue.Enqueue(delegate
@@ -467,6 +495,8 @@ namespace ClipFlow
                 string sourceApp;
                 string sourceTitle;
                 GetForegroundApp(out sourceApp, out sourceTitle);
+                if (ClipboardCapturePolicy.ShouldIgnoreSource(_settings, sourceApp) ||
+                    ClipboardCapturePolicy.ShouldIgnoreText(_settings, text)) return;
                 _storageQueue.Enqueue(delegate
                 {
                     _store.AddOrRefresh(text, rtf, html, sourceApp, sourceTitle);
@@ -490,9 +520,10 @@ namespace ClipFlow
         private void RefreshResults()
         {
             ClipboardItem selected = GetSelectedItem();
+            string sourceApp = SelectedSourceApplication();
             List<ClipboardItem> results = _showInvalidFiles
-                ? _store.SearchInvalidFiles(100)
-                : _store.Search(_searchBox.Text, 100);
+                ? _store.SearchInvalidFiles(sourceApp, 100)
+                : _store.Search(_searchBox.Text, sourceApp, 100);
             _resultsList.Items.Clear();
             foreach (ClipboardItem item in results)
             {
@@ -514,7 +545,11 @@ namespace ClipFlow
             Dispatcher.BeginInvoke(new Action(delegate
             {
                 if (_isExiting) return;
-                if (IsVisible) RefreshResults();
+                if (IsVisible)
+                {
+                    RefreshSourceFilter();
+                    RefreshResults();
+                }
                 if (!string.IsNullOrEmpty(message)) _statusText.Text = message;
             }));
         }
@@ -522,6 +557,33 @@ namespace ClipFlow
         private void StorageQueueFailed(Exception exception)
         {
             NotifyStorageChanged("保存失败，请稍后重试");
+        }
+
+        private string SelectedSourceApplication()
+        {
+            string value = Convert.ToString(_sourceFilter.SelectedItem);
+            return string.IsNullOrEmpty(value) || value == "全部应用" ? null : value;
+        }
+
+        private void RefreshSourceFilter()
+        {
+            if (_sourceFilter == null) return;
+            string selected = SelectedSourceApplication();
+            List<string> applications = _store.GetSourceApplications(30);
+            _updatingSourceFilter = true;
+            try
+            {
+                _sourceFilter.Items.Clear();
+                _sourceFilter.Items.Add("全部应用");
+                foreach (string application in applications) _sourceFilter.Items.Add(application);
+                string matched = applications.Find(item =>
+                    string.Equals(item, selected, StringComparison.OrdinalIgnoreCase));
+                _sourceFilter.SelectedItem = string.IsNullOrEmpty(matched) ? "全部应用" : matched;
+            }
+            finally
+            {
+                _updatingSourceFilter = false;
+            }
         }
 
         private void PasteSelected(bool plainTextOnly)
